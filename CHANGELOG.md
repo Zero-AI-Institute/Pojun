@@ -3,6 +3,204 @@
 本项目的重要变更记录在此文件中，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
 ## [Unreleased]
+### 新增（issue #41）
+
+- **curl 系工具支持可选 `user_agent`（issue #41）**：`http_probe` / `api_contract` /
+  `diff_responses` / `js_audit` 四个工具的入参加入可选 `user_agent`，让模型能以
+  单个参数复现特定客户端身份，不再手拼命令。省略或传空时所有生成物与改动前
+  **逐字节一致**（命令、实际请求、输出 JSON 不变）；实现上 probe 用脚本内
+  `--ua` + `ua_args` 数组、contract 用条件 `uaArg`、diff 用条件 argv（A/B 共用，
+  `-H` 优先于 `-A`）、js_audit 用 `--ua` 覆盖且只改 User-Agent 头（三个 Accept*
+  头保持原值）。校验收敛到新入口 `normalizeToolUserAgent`（`agent/tools_ua.go`）：
+  前后空白 trim、仅可打印 ASCII 0x20-0x7E、≤1024 字节——curl 走 shell 单引号
+  透传，CR/LF 会变成新的头（CWE-113），必须拒绝式校验；非法值报错含 0-based
+  偏移与 0xXX、不落脚本。`diff_responses` 文件模式忽略该参数。老库升级无需
+  迁移：server 启动时 `MergeToolSchemaProperty` 会幂等补进新属性。
+
+### 安全
+
+- **控制台默认仅本机**：`cmd/pojun` 的 `-addr` 默认由 `:8787` 改为
+  `127.0.0.1:8787`，非回环绑定时启动日志打印 WARN。systemd unit / launchd plist
+  由 `install.sh` 显式透传规范化后的地址（旧 plist 不传 `-addr`，导致 `--listen`
+  在 macOS 上静默失效，已修复）。
+- **安装器监听地址归一**：`--listen` 支持 `IP:端口` / 纯端口 / `[IPv6]:端口`，
+  拒绝主机名、IPv6 zone、空/越界端口；`--listen=:PORT` 保持「空 host = 全接口」
+  语义并告警。Docker 形态拆分 `PROBE_HOST` / `PUBLISH_HOST`：`--listen=127.0.0.1:9000`
+  生成的端口映射不再丢弃 IP 前缀；健康检查按实际绑定地址探测，
+  `--listen=<局域网IP>:8787` 不再 30 次失败退出。
+- **Docker 宿主侧默认回环**：仓库 `docker-compose.yml` 改为
+  `${POJUN_BIND_IP:-127.0.0.1}:8787:8787`；容器内仍监听 `0.0.0.0:8787`（镜像 CMD
+  不变，否则 published port 不可达）。
+- **品牌资产去稳定枚举路径**：`web/public/logo.png` 移到
+  `web/src/assets/logo.png` 改为模块导入；删除 `public/logo.svg`、
+  `public/logo-mono.svg`、`public/favicon.ico`；删除 1920×1920 的
+  `app/icon.png`，新增中性 `app/icon.svg` 并替换为同源中性 `favicon.ico`
+  （16/32/48）。登录页移除只读 `POJUN` 用户名输入框。
+- 公开 JS chunk 仍含登录契约所需的 `POJUN` 字面量、mock/demo 字符串与
+  `package.json` 内联，`logo.png` 的哈希副本仍在 `_next/static/media` 下——
+  未鉴权者仍可取到该品牌图（只是路径从稳定 URL 变成带哈希的构建产物路径），
+  静态导出无法隐藏，留作后续治理。
+
+### 升级须知
+
+- 重跑 `install.sh` 会重写 unit/plist/生成的 compose 并重启服务，监听地址回到
+  `127.0.0.1:8787`；检测到旧安装是全接口时会打印醒目告警（现在按 `-addr` /
+  ports 的实际地址判断，不再只认 8787 与裸 `"8787:8787"`，`--listen=:9000`、
+  `<网卡IP>:8787` 等旧安装同样会告警）。保留局域网/公网直连需显式
+  `--listen=0.0.0.0:<端口>`。
+- Docker 放开旋钮分两种：仓库根 `docker-compose.yml` 用
+  `POJUN_BIND_IP=0.0.0.0`；`install.sh --mode=docker` 生成的 compose 是字面量，
+  只认 `--listen=0.0.0.0:<端口>`（或手改生成的 compose）。
+- **macOS 旧 launchd plist**：旧 plist 不传 `-addr`，应用内「一键更新」重启时
+  不经过安装器。`start.sh` 检测到这种旧 plist 会沿用旧默认 `-addr :8787` 并告警，
+  避免远端控制台静默失联；重跑 `install.sh` 后 plist 固定为规范化地址。
+- `--listen=:PORT` 仍是全接口（与二进制 `-addr :PORT` 一致），会告警。
+
+### 测试
+
+- 新增 `TestDefaultListenAddrIsLoopback` / `TestIsLoopbackListenAddr`。
+- 新增 `scripts/install_listen_test.sh`：抽取 install.sh 的监听地址函数做输入
+  矩阵断言（默认 / 纯端口 / `0.0.0.0` / IPv6 / 非法 IPv4 / 主机名 / zone /
+  端口越界）、回环判定、compose 端口映射判定与 `PORTMAP` 生成；CI 中执行。
+- CI：`bash -n install.sh`；前端静态导出后断言品牌资产已移除且图标中性；
+  compose job 打印版本、断言仓库 compose 与 `windows`/`macos` 合并后的宿主
+  `host_ip`。
+- macOS 冒烟新增 plist `-addr` 与 `lsof` 仅回环断言，并改为 `pull_request`
+  （路径命中 install.sh）触发。
+
+## [0.4.98] - 2026-11-22
+### 安全：issue #51/#52 校验一致性修复（FldBudin 报告）
+
+- **#52 CRLF 注入与 @file 本地文件读取**：diff_responses 的 header_a/header_b
+  与 auth_request 的 header 值过 `normalizeHeaderValue`——可打印 ASCII + 拒 @
+  前缀（curl -H @file 会把本地文件行当请求头发给目标）。此前模型可控的
+  header 值直接进 curl -H，CRLF 可注入新请求头（CWE-113）、@ 前缀可外泄
+  本地文件。
+- **#51 http_request.user_agent 校验一致性**：http_request 的 user_agent 切到
+  `normalizeToolUserAgent`——与四个 shell-out 工具同行为，模型看到一致的中文
+  校验错误（含 0-based 偏移）而非 net/http 发送期报错。
+
+## [0.4.97] - 2026-11-22
+### 新增/安全：社区 PR 合并（FldBudin 三件）
+
+- **PR #44 控制台安全加固**：bare binary 默认监听 `127.0.0.1:8787`（显式传
+  `-addr 0.0.0.0:8787` 或反向代理才暴露公网，非回环绑定打响亮警告）；
+  品牌 logo/图标移出未鉴权静态面（改用模块导入+哈希文件名）；CI 加安装脚本
+  语法检查、监听归一测试矩阵与品牌资产回归断言。直接对齐 Reversing Labs
+  ARTEX 追踪报告中「1000+ 暴露控制台」的暴露面发现。
+- **PR #54 离线身份扫描器 idscan**（issue #40）：`traffic/idscan`——按词表统计
+  历史流量中的品牌串（构建路径/控制台标题/favicon hash）与录制覆盖率，
+  `pojun-maint idscan` CLI 同步；词表可自定义扩展。
+
+### 测试
+
+- PR53：UA 校验矩阵（ASCII 边界/超长/空白）+ 四工具参数穿透测试。
+- PR54：idscan 分词/聚合/脱敏/匹配 548 行测试。
+- PR44：CI 级品牌资产回归 + 安装脚本监听归一矩阵。
+
+## [0.4.96] - 2026-11-22
+### 新增：内部版散件同步（v0.9.56/64/50/49 四项）
+
+- **预设参数预填补全**（补 v0.4.93 缺口，对照内部版 v0.9.64）：
+  - Preset/ModelEntry 加 `max_tokens`/`thinking_type`/`reasoning_effort`（模型级覆盖优先于预设级）；
+  - Anthropic 协议预设（Anthropic/MiniMax/LongCat/自定义中转）全部预填 `max_tokens: 8192`
+    （Anthropic 协议必填，缺=400）；LongCat 4096；
+  - OpenCode Go 加 `user_agent: coding-agent/1.0`；智谱 GLM 预填 `thinking_type: enabled`；
+  - 前端 pickPreset/pickModel 自动带入（用户手改不覆盖）。
+- **登录限流加固**（内部版 v0.9.56）：全局锁存活时**正确密码仍执行一次校验**——
+  正确则清全局锁放行，错误才 429。此前撞库流量连带锁死管理员 5 分钟（管理员 DoS）；
+  recordSuccess 同时清全局计数。
+- **模型断流恢复**（内部版 v0.9.50）：新增流空闲看门狗装饰器（180s 无事件主动断开，
+  错误冒泡为可重试瞬时故障由 task_llm 重试层承接重放，norma fork 零改动）；
+  committed 语义修正——SEThinkingDelta 不再算已提交输出（thinking 丢失可重生成）。
+- **prove_goal 严格判定**（内部版 v0.9.49）：goalItem 加 `criteria`（分号分隔多条）；
+  带 criteria 的目标 prove_goal 必须逐条给出 proofs（每条独立 high/critical finding
+  节点），全部满足才 met，proof 结构原子落 payload；无 criteria 旧目标行为不变。
+
+### 测试
+
+- validators 全分支沿用；回归四包全绿（agent/server/db/llmpresets）。
+
+## [0.4.95] - 2026-11-22
+### 安全：开发期数据脱敏（公开仓库信息卫生）
+
+- **真实目标/客户名清理**：任务 Playbook 种子、CHANGELOG 历史条目、前端注释里的
+  实测目标地名/机构名/客户名全部泛化（政企/事业单位站点），不泄露作业历史与
+  客户行业映射。
+- **基础设施信息清理**：公开交接文档里的测试机/公网机 IP、SSH 用户名、生产测试
+  机与出网代理内网地址全部改为「见本地记忆」占位；测试夹具里的内网网段泛化为
+  TEST-NET 文档段（192.0.2.0/24）。
+- Kali 已部署实例的 task_templates 种子行同步 UPDATE（既有部署的行不随 seed
+  flag 重刷）。
+
+## [0.4.94] - 2026-11-22
+### 新增：经验层（方向调研批次三——playbook 武器库/变体意图族/资产 SimHash）
+
+- **资产 SimHash 指纹**：assets 加 `simhash` 列（64-bit，路径段归一——数字→N/
+  hex→H/UUID→U、参数名集合、title/长度分桶加权）；HTTP service upsert 自动写入。
+  `SimilarHTTPEndpoints` 在同 root_domain 下按汉明距离 ≤6 找同模式端点。
+- **Playbook 武器库**：validator PASS 的 critical/high 上报自动沉淀成功攻击链快照
+  （意图原文/假设/判据/关键 facts/机验标记，代码组装不依赖 LLM 提炼）——
+  归一化键 vulnclass+路径模式去重（同模式复现 used_count++/合并技术栈/severity
+  取更严重者，steps 上限 5 条）；planner 每轮态势注入「历史成功先例」Top3
+  （同 root_domain 排前/技术栈交集/复用次数排序），settings 开关
+  `playbook_inject_enabled` 默认开。
+- **变体分析意图族**（Naptime 变体分析 + planner.go:397 同族迁移的确定性下限）：
+  validator PASS 的 critical/high 上报后，SimHash 找同簇端点（排除源资产，取 2），
+  自动派「变体验证」意图（hypothesis=同结构端点大概率复用同一实现、
+  success_criteria=validate_finding 输出 pass、payload 带 variant_of 锚定源
+  finding、ParentIDs 锚 finding 节点）；防重派复用 FindSimilarOpenIntent 三闸；
+  settings 开关 `variant_intents_enabled` 默认开。planner prompt 纪律保留。
+
+### 测试
+
+- simhash 计算/汉明距离/同簇查询/路径夹逼单测；回归四包全绿。
+
+## [0.4.93] - 2026-11-22
+### 新增：能力域快赢 + 预设参数预置收尾（方向调研批次二）
+
+- **预设参数预置**（用户反馈：OpenCode Go 的会话头不该让用户手动配）：`llmpresets.Preset`
+  扩展 `session_header_key`/`user_agent`/`max_tokens_field` 三个差异化参数字段，
+  选预设即自动带入表单——opencode-go 预设直接预置 `x-opencode-session`，
+  「选卡片→粘 Key→拉模型→保存并激活」全程不再进高级设置。选模型时按元数据
+  自动推断 `max_tokens_field`（openai 格式 + reasoning 模型 → max_completion_tokens，
+  与 context_window_k 同款防覆盖）。
+- **云元数据凭据链**（能力域 #11）：SSRF validator 命中云元数据探针后自动深取——
+  AWS IMDS 角色列表→凭据 JSON（AccessKeyId/SecretAccessKey/SessionToken）、
+  GCP 默认服务账号 token（Metadata-Flavor 头）。提取到的凭据明文进
+  `credentials` 字段（目标侧泄露物不打码），note 附 STS GetCallerIdentity /
+  GCP projects 只读验证的 curl 指引。
+- **浏览器 XSS 执行断言**（能力域 #14，新增 chromedp 依赖 v0.24，纯 Go MIT）：
+  反射命中后自动用无头 chromium 加载探针页面、监听 alert() 弹窗真实触发——
+  执行级证据直接把 verdict 升 pass；无浏览器/加载失败自动降级维持 warn。
+  浏览器探针走平台出口代理（OPSEC：不留真实 IP）。v0.24 新 API 适配
+  （泛型 Run + Steps 组合 + Events 迭代器 + HandleJavaScriptDialog 应答）。
+- **js_audit 密钥模式扩充**（能力域 #12）：7→13 条——GCP service account 标记、
+  Google API key（AIza）、Stripe sk_live_、SendGrid SG.、GitHub PAT、Slack token、
+  通用 password/secret/token 长随机赋值。
+- **js_audit OSV 依赖比对**：还原源码里的 package.json 依赖版本批量查
+  api.osv.dev/v1/querybatch（上限 100 包，失败不影响主流程），命中已知漏洞
+  输出 osv_vulns 事件（先 record_fact，确认可达再上报）。
+
+### 测试
+
+- validators：云凭据解析/Note 透传/浏览器 Skipped 路径（新增于既有十分支之上）。
+- js_audit：py_compile + 端到端 gzip/secret 固件沿用（新正则经真实 fixture 验证）。
+
+## [0.4.92] - 2026-11-22
+### 新增：验证层冲刺（方向调研共识①——程序化验证 oracle + harness 加固）
+
+- **`validate_finding` 工具 + `agent/validators` 验证库**：按漏洞类别跑程序化验证探针并对响应做机械断言（XBOW validators / AIxCC PoV 范式的平台落地）。v1 三类——RCE/命令注入（echo token 回显断言 + sleep 时延盲注判定）、XSS（唯一标记反射+上下文断言+CSP 核查，严格 CSP 降 warn；执行级确认仍建议浏览器步骤）、SSRF（OOB 回连经 listener.Session.Preview 捕获 + 文件读取/云元数据响应断言）。pass 时输出证据标记 `validate:<token>:pass`，引用进 report_finding 的 evidence 即完成机验闭环；探针走平台出口代理+流量录制，全程经 guard 审查链。
+- **evidence_check 新增机验项**：evidence 含 PASS 标记时「程序化验证标记」检查项通过（非必过、只加分——validator 覆盖面有限）。
+- **意图预算硬化**：nudge 文案带具体数字（已用/上限/剩余）；新增墙钟维度（`intent_budget_minutes`，0=关）；新增 **hard 模式**（`intent_budget_mode=hard`）——超预算后拦截一切非收尾工具（settlement 禁用表），只留 record_fact/report_finding/wrapup 类写回动作，等价强制收尾（soft 模式默认不变）。
+- **`read_output` 工具**：SDK 超长输出落盘文件的按行窗口回读——路径限定 cmd-output 目录（basename 夹逼防越界）、自带总行数与翻页提示，替代用 Bash cat 整段往返（「可回读的省略」收口件）。
+- **设置页**：意图预算卡片补墙钟预算输入与 soft/hard 模式选择。
+
+### 测试
+
+- `agent/validators`：三 runner 全分支（回显/时延/反射/转义/严格 CSP/文件特征/OOB/Note 透传/注入参数处理）10 测。
+- `server/engine_budget_test.go`：nudge 数字/hard 置位/墙钟触发/soft 不置位/hard 拦截链（拦 http_request 放行 record_fact）。
+- `agent/tools_readoutput_test.go`：窗口/翻页/越界提示/路径夹逼/无 runDir。
 
 ## [0.4.91] - 2026-11-21
 ### 新增：LLM 配置模块重构（厂商知识层 + 三步新建向导）
@@ -1001,7 +1199,7 @@
 ### 新增
 
 - **内置 4 个任务 Playbook**（借鉴 PentestAgent）：Web 全流程渗透 / 内网域渗透 /
-  APP 逆向+API / 纯侦察资产盘点——安康系列实测验证过的目标结构，建任务一键套用；
+  APP 逆向+API / 纯侦察资产盘点——政企/事业单位站点实测调优的目标结构，建任务一键套用；
   settings flag 批次种子，用户删改不复活。附幂等测试。
 - **独立复现规划规则**（借鉴 Pentest-AI / Pentest-Swarm-AI）：critical/high 若
   证据仅来自单一 worker、无独立复验事实，planner 派「只复现不扩大」的验证意图；
@@ -1418,7 +1616,7 @@
     `revokeObjectURL` 延迟 30s（Safari 立即 revoke 会拿到空 URL，表现为"点了没反应"）；
   - 按钮加 loading 态（"导出中…" + spinner），成功/失败均 toast 提示——此前 20–25MB
     的大文件下载在手机上无任何反馈，用户容易误以为失败或重复点击。
-- **任务详情头部移动端重构**：标题不再被挤成"陕西步长…"；状态/模型切换/归档移到
+- **任务详情头部移动端重构**：标题不再被挤成长任务名前缀；状态/模型切换/归档移到
   手机端第二行，目标描述两行显示，恢复/暂停按钮保留首行。
 - **任务详情「发现」Tab 行重构**：手机端改为双行——首行 严重度+标题+摘要，次行
   流量证据/状态/详情；此前固定宽度徽标把标题列挤没、左侧严重度被裁。
@@ -2347,7 +2545,7 @@
 
 - **任务详情页「发现」页签的继承发现混在本任务发现里**：派生任务继承源任务**全部已结束的
   发现**——实测任务 4 的接口返回 273 条，其中 214 条 inherited（来自任务 3），只有 59 条是
-  任务 4 自己报的。两条任务的名字又都以「安康职业技术学院」开头、在「所属任务」列被截断，
+  任务 4 自己报的。两条任务的名字共享同一段长前缀、在「所属任务」列被截断，
   肉眼根本分不清哪条是本任务报的、哪条是继承的。
   - 改成：继承的按来源任务折叠成「来自任务 #3 的历史发现（214 条 · 只读）」，默认收起；
     本任务自己的发现照常平铺。后台逻辑不动（继承本身有用：少干重复活、结论可复用）。

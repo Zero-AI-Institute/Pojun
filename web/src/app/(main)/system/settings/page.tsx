@@ -55,6 +55,8 @@ export default function SystemSettingsPage() {
   const [autoFinishMax, setAutoFinishMax] = React.useState("80");
   const [intentBudgetEnabled, setIntentBudgetEnabled] = React.useState(true);
   const [intentBudgetTokens, setIntentBudgetTokens] = React.useState("3000000");
+  const [intentBudgetMinutes, setIntentBudgetMinutes] = React.useState("0");
+  const [intentBudgetMode, setIntentBudgetMode] = React.useState("soft");
   const [savingIntentBudget, setSavingIntentBudget] = React.useState(false);
   const [savingAutoFinish, setSavingAutoFinish] = React.useState(false);
   // 冷节点压缩的输出预算与墙钟上限。0=用默认值(65536 token / 20 分钟)。
@@ -102,6 +104,8 @@ export default function SystemSettingsPage() {
     setAutoFinishMax(String(s.auto_finish_max_rounds ?? 80));
     setIntentBudgetEnabled(s.intent_budget_enabled !== false);
     setIntentBudgetTokens(String(s.intent_budget_tokens ?? 3000000));
+    setIntentBudgetMinutes(String(s.intent_budget_minutes ?? 0));
+    setIntentBudgetMode(s.intent_budget_mode === "hard" ? "hard" : "soft");
   }, []);
 
   const saveWorkers = () => {
@@ -165,9 +169,23 @@ export default function SystemSettingsPage() {
       toast.error("意图 token 预算必须在 500000–20000000 之间");
       return;
     }
+    const mins = Number(intentBudgetMinutes);
+    if (!Number.isInteger(mins) || mins < 0 || mins > 240) {
+      toast.error("墙钟预算必须在 0–240 分钟（0=关）");
+      return;
+    }
+    if (intentBudgetMode !== "soft" && intentBudgetMode !== "hard") {
+      toast.error("预算模式仅支持 soft / hard");
+      return;
+    }
     setSavingIntentBudget(true);
     api
-      .setSettings({ intent_budget_enabled: intentBudgetEnabled, intent_budget_tokens: tokens })
+      .setSettings({
+        intent_budget_enabled: intentBudgetEnabled,
+        intent_budget_tokens: tokens,
+        intent_budget_minutes: mins,
+        intent_budget_mode: intentBudgetMode,
+      })
       .then((s) => {
         apply(s);
         toast.success("已保存意图预算（对之后启动的意图生效）");
@@ -1016,19 +1034,45 @@ export default function SystemSettingsPage() {
                 onCheckedChange={setIntentBudgetEnabled}
               />
             </div>
-            <label className="flex flex-col gap-1 text-sm">
-              <span>单意图 token 预算（500000–20000000）</span>
-              <Input
-                type="number"
-                min={500000}
-                max={20000000}
-                step={100000}
-                className="w-full font-mono text-sm sm:w-48"
-                value={intentBudgetTokens}
-                disabled={!loaded || savingIntentBudget}
-                onChange={(e) => setIntentBudgetTokens(e.target.value)}
-              />
-            </label>
+            <div className="flex flex-wrap items-end gap-3">
+              <label className="flex flex-col gap-1 text-sm">
+                <span>单意图 token 预算（500000–20000000）</span>
+                <Input
+                  type="number"
+                  min={500000}
+                  max={20000000}
+                  step={100000}
+                  className="w-full font-mono text-sm sm:w-48"
+                  value={intentBudgetTokens}
+                  disabled={!loaded || savingIntentBudget}
+                  onChange={(e) => setIntentBudgetTokens(e.target.value)}
+                />
+              </label>
+              <label className="flex flex-col gap-1 text-sm">
+                <span>墙钟预算（分钟，0=关）</span>
+                <Input
+                  type="number"
+                  min={0}
+                  max={240}
+                  className="w-full font-mono text-sm sm:w-32"
+                  value={intentBudgetMinutes}
+                  disabled={!loaded || savingIntentBudget}
+                  onChange={(e) => setIntentBudgetMinutes(e.target.value)}
+                />
+              </label>
+              <label className="flex flex-col gap-1 text-sm">
+                <span>超预算模式</span>
+                <Select value={intentBudgetMode} onValueChange={setIntentBudgetMode}>
+                  <SelectTrigger className="w-40">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="soft">soft（提醒一次）</SelectItem>
+                    <SelectItem value="hard">hard（强制收尾）</SelectItem>
+                  </SelectContent>
+                </Select>
+              </label>
+            </div>
             <div>
               <Button onClick={saveIntentBudget} disabled={!loaded || savingIntentBudget}>
                 {savingIntentBudget ? "保存中…" : "保存"}

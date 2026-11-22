@@ -64,8 +64,8 @@ source_scope_assets AS (
 type AssetScopeClass string
 
 const (
-	ScopeClassOwn    AssetScopeClass = "own"
-	ScopeClassSource AssetScopeClass = "source"
+	ScopeClassOwn     AssetScopeClass = "own"
+	ScopeClassSource  AssetScopeClass = "source"
 	ScopeClassForeign AssetScopeClass = "foreign"
 )
 

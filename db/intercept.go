@@ -35,10 +35,10 @@ type InterceptRule struct {
 // 顺序写错编译器不报错，而每新增一个字段都要改遍所有调用点。结构体让
 // 「加字段」只影响构造它的那一处。
 type InterceptRuleInput struct {
-	Name           string
-	MatchTarget    string
-	MatchType      string
-	ToolScope      []string
+	Name        string
+	MatchTarget string
+	MatchType   string
+	ToolScope   []string
 	// ToolScopeSet 为 true 表示本次要写 tool_scope（可以是空切片＝清空）；
 	// false 表示保留库中既有值。仅在 Update 有意义——Create 总是使用 ToolScope。
 	ToolScopeSet   bool

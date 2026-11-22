@@ -17,7 +17,7 @@ func TestMatchAssetInterceptRules(t *testing.T) {
 		wantVal string
 	}{
 		{"内置模糊政府域名命中", []AssetInterceptRule{rule("fuzzy_domain", ".gov.cn", true)},
-			[]string{"www.beijing.gov.cn"}, nil, nil, true, "www.beijing.gov.cn"},
+			[]string{"www.example.gov.cn"}, nil, nil, true, "www.example.gov.cn"},
 		{"模糊教育域名命中", []AssetInterceptRule{rule("fuzzy_domain", ".edu", true)},
 			[]string{"mit.edu"}, nil, nil, true, "mit.edu"},
 		{"全等域名命中大小写不敏感", []AssetInterceptRule{rule("exact_domain", "Example.com", true)},
@@ -101,14 +101,14 @@ func TestEvaluateAssetGate(t *testing.T) {
 
 func TestAssetInterceptCandidates(t *testing.T) {
 	// 只带 URL 的服务资产：host 应被拆出并归入域名候选，从而被 fuzzy_domain 命中。
-	a := &Asset{Type: "service", URL: "https://portal.beijing.gov.cn:8443/app"}
+	a := &Asset{Type: "service", URL: "https://portal.example.gov.cn:8443/app"}
 	domains, _, urls := a.interceptCandidates()
 	if len(urls) != 1 || urls[0] != a.URL {
 		t.Fatalf("urls = %v", urls)
 	}
 	found := false
 	for _, d := range domains {
-		if d == "portal.beijing.gov.cn" {
+		if d == "portal.example.gov.cn" {
 			found = true
 		}
 	}

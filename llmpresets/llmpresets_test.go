@@ -62,8 +62,8 @@ func TestLookupMeta(t *testing.T) {
 		wantK  int
 		source string
 	}{
-		{"deepseek-v4.1-flash", 1024, SourceMeta}, // OpenCode Zen 官方实测 1M
-		{"DeepSeek-V4.1-Flash", 1024, SourceMeta},       // 大小写不敏感
+		{"deepseek-v4.1-flash", 1024, SourceMeta},      // OpenCode Zen 官方实测 1M
+		{"DeepSeek-V4.1-Flash", 1024, SourceMeta},      // 大小写不敏感
 		{"claude-opus-4-8-20261101", 200, SourceMeta},  // 日期后缀前缀命中
 		{"anthropic/claude-opus-4-5", 200, SourceMeta}, // 厂商前缀剥除
 		{"gpt-4o", 128, SourceMeta},

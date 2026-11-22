@@ -8,19 +8,68 @@
     "auth_note": "API Key 走 Authorization: Bearer 头（opencode.ai/console 获取）",
     "note": "官方实测：本条覆盖走 OpenAI 协议的模型——DeepSeek V4 系 / GLM 5.x / Kimi K 系 / MiniMax M 系 / Qwen3.x / 全部免费模型。GPT/Grok/Muse 系走 Responses 协议（选 openai-responses 格式另建一条、base 相同）；Claude 系走 Anthropic 协议（用下一条 Zen Go 或 anthropic 格式）。模型清单在线拉取（/zen/v1/models 公开，103 个）。",
     "models": [
-      { "id": "deepseek-v4.1-flash", "context_k": 1024, "reasoning": true },
-      { "id": "deepseek-v4-pro", "context_k": 1024, "reasoning": true },
-      { "id": "deepseek-v4-flash", "context_k": 1024, "reasoning": true },
-      { "id": "glm-5.3", "context_k": 1024, "reasoning": true },
-      { "id": "glm-5.3-flash", "context_k": 1024, "reasoning": true },
-      { "id": "kimi-k3", "context_k": 1024, "reasoning": true },
-      { "id": "kimi-k2.7-code", "context_k": 1024, "reasoning": true },
-      { "id": "minimax-m3", "context_k": 1024, "reasoning": true },
-      { "id": "qwen3.8-max", "context_k": 1024, "reasoning": true },
-      { "id": "big-pickle", "context_k": 200, "reasoning": true },
-      { "id": "longcat-2.5-preview-free", "context_k": 200, "reasoning": false },
-      { "id": "step-5-preview-free", "context_k": 200, "reasoning": true }
-    ]
+      {
+        "id": "deepseek-v4.1-flash",
+        "context_k": 1024,
+        "reasoning": true
+      },
+      {
+        "id": "deepseek-v4-pro",
+        "context_k": 1024,
+        "reasoning": true
+      },
+      {
+        "id": "deepseek-v4-flash",
+        "context_k": 1024,
+        "reasoning": true
+      },
+      {
+        "id": "glm-5.3",
+        "context_k": 1024,
+        "reasoning": true
+      },
+      {
+        "id": "glm-5.3-flash",
+        "context_k": 1024,
+        "reasoning": true
+      },
+      {
+        "id": "kimi-k3",
+        "context_k": 1024,
+        "reasoning": true
+      },
+      {
+        "id": "kimi-k2.7-code",
+        "context_k": 1024,
+        "reasoning": true
+      },
+      {
+        "id": "minimax-m3",
+        "context_k": 1024,
+        "reasoning": true
+      },
+      {
+        "id": "qwen3.8-max",
+        "context_k": 1024,
+        "reasoning": true
+      },
+      {
+        "id": "big-pickle",
+        "context_k": 200,
+        "reasoning": true
+      },
+      {
+        "id": "longcat-2.5-preview-free",
+        "context_k": 200,
+        "reasoning": false
+      },
+      {
+        "id": "step-5-preview-free",
+        "context_k": 200,
+        "reasoning": true
+      }
+    ],
+    "max_tokens": 8192
   },
   {
     "id": "opencode-go",
@@ -29,14 +78,37 @@
     "format": "anthropic",
     "base_url": "https://opencode.ai/zen/go",
     "auth_note": "API Key 走 x-api-key 头（Anthropic 协议；与 Zen 标准 Key 同源，opencode.ai/console 获取）",
-    "note": "单一入口统一走 Anthropic 协议，Claude/GPT/DeepSeek/GLM 系模型都能从这里调。必配：高级设置里把「自定义会话头」填 x-opencode-session（头值平台自动填会话 id），否则实测报 MissingSessionID 400。与上一条 Zen 标准网关的区别：Go 是给 Claude Code 类工具的单入口，Zen 是按模型分协议的标准 API。",
+    "note": "单一入口统一走 Anthropic 协议，Claude/GPT/DeepSeek/GLM 系模型都能从这里调。会话头 x-opencode-session 已随本预设自动预置（实测缺失报 MissingSessionID 400），选本卡片即生效，无需手动配置。与上一条 Zen 标准网关的区别：Go 是给 Claude Code 类工具的单入口，Zen 是按模型分协议的标准 API。",
     "models": [
-      { "id": "claude-opus-5-5", "context_k": 1024, "reasoning": true },
-      { "id": "claude-opus-4-8", "context_k": 1024, "reasoning": true },
-      { "id": "claude-sonnet-5-5", "context_k": 1024, "reasoning": true },
-      { "id": "deepseek-v4.1-flash", "context_k": 1024, "reasoning": true },
-      { "id": "glm-5.3", "context_k": 1024, "reasoning": true }
-    ]
+      {
+        "id": "claude-opus-5-5",
+        "context_k": 1024,
+        "reasoning": true
+      },
+      {
+        "id": "claude-opus-4-8",
+        "context_k": 1024,
+        "reasoning": true
+      },
+      {
+        "id": "claude-sonnet-5-5",
+        "context_k": 1024,
+        "reasoning": true
+      },
+      {
+        "id": "deepseek-v4.1-flash",
+        "context_k": 1024,
+        "reasoning": true
+      },
+      {
+        "id": "glm-5.3",
+        "context_k": 1024,
+        "reasoning": true
+      }
+    ],
+    "session_header_key": "x-opencode-session",
+    "max_tokens": 8192,
+    "user_agent": "coding-agent/1.0"
   },
   {
     "id": "openai",
@@ -47,10 +119,26 @@
     "auth_note": "API Key 走 Authorization: Bearer 头（platform.openai.com 获取）",
     "note": "官方端点。GPT-5 系/推理模型需要 max_completion_tokens 字段名（保存后在高级设置里切换）；Codex 系走 Responses 协议，需另建 openai-responses 格式配置（base 相同）。",
     "models": [
-      { "id": "gpt-5.2", "context_k": 400, "reasoning": true },
-      { "id": "gpt-5.1", "context_k": 400, "reasoning": true },
-      { "id": "gpt-4.1", "context_k": 400, "reasoning": false },
-      { "id": "gpt-4o", "context_k": 128, "reasoning": false }
+      {
+        "id": "gpt-5.2",
+        "context_k": 400,
+        "reasoning": true
+      },
+      {
+        "id": "gpt-5.1",
+        "context_k": 400,
+        "reasoning": true
+      },
+      {
+        "id": "gpt-4.1",
+        "context_k": 400,
+        "reasoning": false
+      },
+      {
+        "id": "gpt-4o",
+        "context_k": 128,
+        "reasoning": false
+      }
     ]
   },
   {
@@ -62,11 +150,28 @@
     "auth_note": "API Key 走 x-api-key 头（console.anthropic.com 获取）",
     "note": "官方端点。Claude 系 max_tokens 必填（平台自动补默认值）；sonnet-4-6 以上支持 1M 上下文（Beta，模型 id 加 [1m] 后缀且按高档计价），标准窗口 200K。",
     "models": [
-      { "id": "claude-opus-4-8", "context_k": 200, "reasoning": true },
-      { "id": "claude-opus-4-5", "context_k": 200, "reasoning": true },
-      { "id": "claude-sonnet-4-6", "context_k": 200, "reasoning": true },
-      { "id": "claude-haiku-4-5", "context_k": 200, "reasoning": true }
-    ]
+      {
+        "id": "claude-opus-4-8",
+        "context_k": 200,
+        "reasoning": true
+      },
+      {
+        "id": "claude-opus-4-5",
+        "context_k": 200,
+        "reasoning": true
+      },
+      {
+        "id": "claude-sonnet-4-6",
+        "context_k": 200,
+        "reasoning": true
+      },
+      {
+        "id": "claude-haiku-4-5",
+        "context_k": 200,
+        "reasoning": true
+      }
+    ],
+    "max_tokens": 8192
   },
   {
     "id": "gemini",
@@ -77,9 +182,21 @@
     "auth_note": "API Key 走 Authorization: Bearer 头（aistudio.google.com 获取）",
     "note": "官方 OpenAI 兼容层；不支持 Responses API。超过 200K 上下文的部分按高档计价。",
     "models": [
-      { "id": "gemini-3-pro", "context_k": 1024, "reasoning": true },
-      { "id": "gemini-3-flash", "context_k": 1024, "reasoning": true },
-      { "id": "gemini-2.5-pro", "context_k": 1024, "reasoning": true }
+      {
+        "id": "gemini-3-pro",
+        "context_k": 1024,
+        "reasoning": true
+      },
+      {
+        "id": "gemini-3-flash",
+        "context_k": 1024,
+        "reasoning": true
+      },
+      {
+        "id": "gemini-2.5-pro",
+        "context_k": 1024,
+        "reasoning": true
+      }
     ]
   },
   {
@@ -91,8 +208,16 @@
     "auth_note": "API Key 走 Authorization: Bearer 头（console.x.ai 获取）",
     "note": "官方端点。grok-4.1-fast 支持 2M 上下文。",
     "models": [
-      { "id": "grok-4.1-fast", "context_k": 2048, "reasoning": true },
-      { "id": "grok-4", "context_k": 256, "reasoning": true }
+      {
+        "id": "grok-4.1-fast",
+        "context_k": 2048,
+        "reasoning": true
+      },
+      {
+        "id": "grok-4",
+        "context_k": 256,
+        "reasoning": true
+      }
     ]
   },
   {
@@ -104,7 +229,11 @@
     "auth_note": "API Key 走 Authorization: Bearer 头（console.mistral.ai 获取）",
     "note": "官方端点，OpenAI 兼容。",
     "models": [
-      { "id": "mistral-large-latest", "context_k": 128, "reasoning": false }
+      {
+        "id": "mistral-large-latest",
+        "context_k": 128,
+        "reasoning": false
+      }
     ]
   },
   {
@@ -116,7 +245,11 @@
     "auth_note": "API Key 走 Authorization: Bearer 头（dashboard.cohere.com 获取）",
     "note": "官方 OpenAI 兼容层（compatibility/v1）；原生 Cohere 协议另有主端点。",
     "models": [
-      { "id": "command-a-03-2025", "context_k": 256, "reasoning": false }
+      {
+        "id": "command-a-03-2025",
+        "context_k": 256,
+        "reasoning": false
+      }
     ]
   },
   {
@@ -128,9 +261,21 @@
     "auth_note": "API Key 走 Authorization: Bearer 头（perplexity.ai/settings/api 获取）",
     "note": "无在线模型列表接口——模型名直接手填（sonar / sonar-pro / sonar-reasoning-pro）。",
     "models": [
-      { "id": "sonar-pro", "context_k": 200, "reasoning": false },
-      { "id": "sonar", "context_k": 128, "reasoning": false },
-      { "id": "sonar-reasoning-pro", "context_k": 128, "reasoning": true }
+      {
+        "id": "sonar-pro",
+        "context_k": 200,
+        "reasoning": false
+      },
+      {
+        "id": "sonar",
+        "context_k": 128,
+        "reasoning": false
+      },
+      {
+        "id": "sonar-reasoning-pro",
+        "context_k": 128,
+        "reasoning": true
+      }
     ]
   },
   {
@@ -142,8 +287,16 @@
     "auth_note": "API Key 走 Authorization: Bearer 头（openrouter.ai/keys 获取）",
     "note": "聚合 400+ 模型（官方/开源/free 全齐），模型 id 带厂商前缀（如 anthropic/claude-sonnet-4.5）；:free 后缀为免费通道；模型列表接口带完整 context/定价元数据。",
     "models": [
-      { "id": "deepseek/deepseek-chat", "context_k": 128, "reasoning": false },
-      { "id": "anthropic/claude-sonnet-4.5", "context_k": 200, "reasoning": true }
+      {
+        "id": "deepseek/deepseek-chat",
+        "context_k": 128,
+        "reasoning": false
+      },
+      {
+        "id": "anthropic/claude-sonnet-4.5",
+        "context_k": 200,
+        "reasoning": true
+      }
     ]
   },
   {
@@ -155,9 +308,21 @@
     "auth_note": "API Key 走 Authorization: Bearer 头（console.groq.com 获取）",
     "note": "开源模型高速推理（Llama/Qwen/Kimi 开源版）。",
     "models": [
-      { "id": "llama-3.3-70b-versatile", "context_k": 131, "reasoning": false },
-      { "id": "openai/gpt-oss-120b", "context_k": 131, "reasoning": true },
-      { "id": "moonshotai/kimi-k2", "context_k": 131, "reasoning": true }
+      {
+        "id": "llama-3.3-70b-versatile",
+        "context_k": 131,
+        "reasoning": false
+      },
+      {
+        "id": "openai/gpt-oss-120b",
+        "context_k": 131,
+        "reasoning": true
+      },
+      {
+        "id": "moonshotai/kimi-k2",
+        "context_k": 131,
+        "reasoning": true
+      }
     ]
   },
   {
@@ -169,7 +334,11 @@
     "auth_note": "API Key 走 Authorization: Bearer 头（api.together.ai 获取）",
     "note": "开源模型托管（DeepSeek/Qwen/Llama 系列），OpenAI 兼容。",
     "models": [
-      { "id": "deepseek-ai/DeepSeek-V3.2", "context_k": 128, "reasoning": true }
+      {
+        "id": "deepseek-ai/DeepSeek-V3.2",
+        "context_k": 128,
+        "reasoning": true
+      }
     ]
   },
   {
@@ -181,7 +350,11 @@
     "auth_note": "API Key 走 Authorization: Bearer 头（fireworks.ai 获取）",
     "note": "开源模型托管；另支持 Responses API。",
     "models": [
-      { "id": "deepseek-ai/DeepSeek-V3.2", "context_k": 128, "reasoning": true }
+      {
+        "id": "deepseek-ai/DeepSeek-V3.2",
+        "context_k": 128,
+        "reasoning": true
+      }
     ]
   },
   {
@@ -193,7 +366,11 @@
     "auth_note": "API Key 走 Authorization: Bearer 头（deepinfra.com 获取）",
     "note": "注意路径：OpenAI 兼容端点是 /v1/openai（多一层 /openai），裸 /v1 是其自有 API——最常见的配错点。",
     "models": [
-      { "id": "deepseek-ai/DeepSeek-V3.2", "context_k": 128, "reasoning": true }
+      {
+        "id": "deepseek-ai/DeepSeek-V3.2",
+        "context_k": 128,
+        "reasoning": true
+      }
     ]
   },
   {
@@ -205,7 +382,11 @@
     "auth_note": "API Key 走 Authorization: Bearer 头（cloud.cerebras.ai 获取）",
     "note": "超低延迟开源推理（gpt-oss/Llama/Qwen）。",
     "models": [
-      { "id": "gpt-oss-120b", "context_k": 131, "reasoning": true }
+      {
+        "id": "gpt-oss-120b",
+        "context_k": 131,
+        "reasoning": true
+      }
     ]
   },
   {
@@ -217,7 +398,11 @@
     "auth_note": "API Key 走 Authorization: Bearer 头（build.nvidia.com 获取）",
     "note": "NVIDIA 托管开源模型，模型 id 带厂商前缀（meta/llama-3.3-70b-instruct 等）。",
     "models": [
-      { "id": "meta/llama-3.3-70b-instruct", "context_k": 131, "reasoning": false }
+      {
+        "id": "meta/llama-3.3-70b-instruct",
+        "context_k": 131,
+        "reasoning": false
+      }
     ]
   },
   {
@@ -229,9 +414,21 @@
     "auth_note": "API Key 走 Authorization: Bearer 头（cloud.siliconflow.cn 获取）",
     "note": "聚合 150+ 开源模型（DeepSeek/Qwen/GLM 等），部分免费。",
     "models": [
-      { "id": "deepseek-ai/DeepSeek-V3.2", "context_k": 128, "reasoning": true },
-      { "id": "deepseek-ai/DeepSeek-R1", "context_k": 128, "reasoning": true },
-      { "id": "Qwen/Qwen3-235B-A22B", "context_k": 262, "reasoning": true }
+      {
+        "id": "deepseek-ai/DeepSeek-V3.2",
+        "context_k": 128,
+        "reasoning": true
+      },
+      {
+        "id": "deepseek-ai/DeepSeek-R1",
+        "context_k": 128,
+        "reasoning": true
+      },
+      {
+        "id": "Qwen/Qwen3-235B-A22B",
+        "context_k": 262,
+        "reasoning": true
+      }
     ]
   },
   {
@@ -243,8 +440,16 @@
     "auth_note": "API Key 走 Authorization: Bearer 头（platform.deepseek.com 获取）",
     "note": "官方端点。Anthropic 协议双端点：https://api.deepseek.com/anthropic ——Claude Code 类工具直连用它（可另建一条 anthropic 格式配置）。",
     "models": [
-      { "id": "deepseek-chat", "context_k": 128, "reasoning": false },
-      { "id": "deepseek-reasoner", "context_k": 128, "reasoning": true }
+      {
+        "id": "deepseek-chat",
+        "context_k": 128,
+        "reasoning": false
+      },
+      {
+        "id": "deepseek-reasoner",
+        "context_k": 128,
+        "reasoning": true
+      }
     ]
   },
   {
@@ -256,9 +461,18 @@
     "auth_note": "API Key 走 Authorization: Bearer 头（bigmodel.cn 获取）",
     "note": "官方端点。glm-4.7-flash 有免费额度，常作兜底通道；Claude Code 类工具走 /api/coding/paas/v4。",
     "models": [
-      { "id": "glm-4.7", "context_k": 200, "reasoning": true },
-      { "id": "glm-4.7-flash", "context_k": 128, "reasoning": true }
-    ]
+      {
+        "id": "glm-4.7",
+        "context_k": 200,
+        "reasoning": true
+      },
+      {
+        "id": "glm-4.7-flash",
+        "context_k": 128,
+        "reasoning": true
+      }
+    ],
+    "thinking_type": "enabled"
   },
   {
     "id": "dashscope",
@@ -269,8 +483,16 @@
     "auth_note": "API Key 走 Authorization: Bearer 头（bailian.console.aliyun.com 获取）",
     "note": "OpenAI 兼容模式专属域名（与原生 DashScope 协议是两套端点，别混用）。",
     "models": [
-      { "id": "qwen3-max", "context_k": 262, "reasoning": true },
-      { "id": "qwen-plus", "context_k": 131, "reasoning": true }
+      {
+        "id": "qwen3-max",
+        "context_k": 262,
+        "reasoning": true
+      },
+      {
+        "id": "qwen-plus",
+        "context_k": 131,
+        "reasoning": true
+      }
     ]
   },
   {
@@ -282,9 +504,21 @@
     "auth_note": "API Key 走 Authorization: Bearer 头（platform.moonshot.cn 获取）",
     "note": "国内端点。注意：国内（moonshot.cn）与国际站（moonshot.ai）的 Key 与域名必须配对使用，混用 401。",
     "models": [
-      { "id": "kimi-k2-thinking", "context_k": 262, "reasoning": true },
-      { "id": "kimi-k2.5", "context_k": 262, "reasoning": true },
-      { "id": "moonshot-v1-128k", "context_k": 131, "reasoning": false }
+      {
+        "id": "kimi-k2-thinking",
+        "context_k": 262,
+        "reasoning": true
+      },
+      {
+        "id": "kimi-k2.5",
+        "context_k": 262,
+        "reasoning": true
+      },
+      {
+        "id": "moonshot-v1-128k",
+        "context_k": 131,
+        "reasoning": false
+      }
     ]
   },
   {
@@ -296,9 +530,18 @@
     "auth_note": "API Key 走 x-api-key 头（platform.minimax.io 获取）",
     "note": "官方 OpenAI 风格路径是 /v1/text/chatcompletion_v2（非标准，本平台不适配），Anthropic 兼容端点可用——选本条（anthropic 格式）。国际站 minimax.io / 国内站 minimaxi.com，Key 与域名配对。",
     "models": [
-      { "id": "MiniMax-M2.5", "context_k": 200, "reasoning": true },
-      { "id": "MiniMax-M2.1", "context_k": 200, "reasoning": true }
-    ]
+      {
+        "id": "MiniMax-M2.5",
+        "context_k": 200,
+        "reasoning": true
+      },
+      {
+        "id": "MiniMax-M2.1",
+        "context_k": 200,
+        "reasoning": true
+      }
+    ],
+    "max_tokens": 8192
   },
   {
     "id": "stepfun",
@@ -309,8 +552,16 @@
     "auth_note": "API Key 走 Authorization: Bearer 头（platform.stepfun.com 获取）",
     "note": "官方端点，OpenAI 兼容。",
     "models": [
-      { "id": "step-3", "context_k": 128, "reasoning": false },
-      { "id": "step-3.5-flash", "context_k": 128, "reasoning": false }
+      {
+        "id": "step-3",
+        "context_k": 128,
+        "reasoning": false
+      },
+      {
+        "id": "step-3.5-flash",
+        "context_k": 128,
+        "reasoning": false
+      }
     ]
   },
   {
@@ -322,8 +573,16 @@
     "auth_note": "API Key 走 Authorization: Bearer 头（千帆控制台获取）",
     "note": "v2 接口兼容 OpenAI/DeepSeek 规范；旧 v1 按应用分开鉴权，别用旧地址。",
     "models": [
-      { "id": "ernie-4.5-turbo-128k", "context_k": 128, "reasoning": false },
-      { "id": "deepseek-r1", "context_k": 128, "reasoning": true }
+      {
+        "id": "ernie-4.5-turbo-128k",
+        "context_k": 128,
+        "reasoning": false
+      },
+      {
+        "id": "deepseek-r1",
+        "context_k": 128,
+        "reasoning": true
+      }
     ]
   },
   {
@@ -335,8 +594,16 @@
     "auth_note": "API Key 走 Authorization: Bearer 头（腾讯云 API 密钥）",
     "note": "官方兼容端点；与 OpenAI 标准有少量参数差异（官方差异表）。",
     "models": [
-      { "id": "hunyuan-turbos", "context_k": 256, "reasoning": true },
-      { "id": "hunyuan-t1", "context_k": 256, "reasoning": true }
+      {
+        "id": "hunyuan-turbos",
+        "context_k": 256,
+        "reasoning": true
+      },
+      {
+        "id": "hunyuan-t1",
+        "context_k": 256,
+        "reasoning": true
+      }
     ]
   },
   {
@@ -348,9 +615,18 @@
     "auth_note": "API Key 走 x-api-key 头（longcat.chat/platform 获取）",
     "note": "Anthropic 协议端点（实测可用）。OpenAI 兼容路径多一层 /openai：api.longcat.chat/openai/v1——走 OpenAI 协议时注意别漏。",
     "models": [
-      { "id": "LongCat-Flash-Chat", "context_k": 128, "reasoning": false },
-      { "id": "LongCat-2.5", "context_k": 128, "reasoning": false }
-    ]
+      {
+        "id": "LongCat-Flash-Chat",
+        "context_k": 128,
+        "reasoning": false
+      },
+      {
+        "id": "LongCat-2.5",
+        "context_k": 128,
+        "reasoning": false
+      }
+    ],
+    "max_tokens": 4096
   },
   {
     "id": "ollama",
@@ -361,8 +637,16 @@
     "auth_note": "免认证（Key 留空即可）",
     "note": "本机 Ollama 的 OpenAI 兼容子集（/v1）；模型列表在线拉取（列出已 pull 的模型）。远程机器把 localhost 换成对应 IP。",
     "models": [
-      { "id": "qwen3:14b", "context_k": 32, "reasoning": true },
-      { "id": "llama3.1:8b", "context_k": 128, "reasoning": false }
+      {
+        "id": "qwen3:14b",
+        "context_k": 32,
+        "reasoning": true
+      },
+      {
+        "id": "llama3.1:8b",
+        "context_k": 128,
+        "reasoning": false
+      }
     ]
   },
   {
@@ -413,6 +697,7 @@
     "base_url": "",
     "auth_note": "API Key 走 x-api-key 头",
     "note": "走 Anthropic 协议的中转通道（如 new-api 的 Claude 通道、DeepSeek 官方 anthropic 端点 api.deepseek.com/anthropic）：填中转地址与 key。连通测试报「协议或路径不匹配」时，换用 OpenAI 兼容模板重试。",
-    "models": []
+    "models": [],
+    "max_tokens": 8192
   }
 ]

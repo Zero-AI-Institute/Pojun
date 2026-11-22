@@ -57,14 +57,15 @@ import (
 
 // diffArgs 是工具入参。
 type diffArgs struct {
-	FileA   string `json:"file_a"`
-	FileB   string `json:"file_b"`
-	URLA    string `json:"url_a"`
-	URLB    string `json:"url_b"`
-	HeaderA string `json:"header_a"`
-	HeaderB string `json:"header_b"`
-	StatusA int    `json:"status_a"`
-	StatusB int    `json:"status_b"`
+	FileA     string `json:"file_a"`
+	FileB     string `json:"file_b"`
+	URLA      string `json:"url_a"`
+	URLB      string `json:"url_b"`
+	HeaderA   string `json:"header_a"`
+	HeaderB   string `json:"header_b"`
+	UserAgent string `json:"user_agent"`
+	StatusA   int    `json:"status_a"`
+	StatusB   int    `json:"status_b"`
 }
 
 // responseDiff 是两段响应之间的结构性差异。
@@ -114,8 +115,8 @@ func diffResponse(statusA, statusB int, bodyA, bodyB string) responseDiff {
 	d := responseDiff{
 		StatusA: statusA, StatusB: statusB,
 		StatusKnown: statusA != 0 || statusB != 0,
-		SameStatus: statusA == statusB,
-		LenA:       len(bodyA), LenB: len(bodyB),
+		SameStatus:  statusA == statusB,
+		LenA:        len(bodyA), LenB: len(bodyB),
 	}
 	objA, okA := parseJSONObject(bodyA)
 	objB, okB := parseJSONObject(bodyB)
@@ -157,11 +158,11 @@ func diffResponse(statusA, statusB int, bodyA, bodyB string) responseDiff {
 				continue
 			}
 			vd := ValueDiff{
-				Key:      k,
-				KindA:    jsonKind(va),
-				KindB:    jsonKind(vb),
-				PreviewA: valuePreview(va),
-				PreviewB: valuePreview(vb),
+				Key:       k,
+				KindA:     jsonKind(va),
+				KindB:     jsonKind(vb),
+				PreviewA:  valuePreview(va),
+				PreviewB:  valuePreview(vb),
 				Sensitive: isSensitiveKey(k),
 			}
 			d.ValueDiffs = append(d.ValueDiffs, vd)
@@ -296,6 +297,7 @@ func looksLikeNoise(v any) bool {
 // 刻意**不含** `key` 与 `session`：
 //   - 裸 `key` 多半是业务字段（cache_key / sort_key / object_key / key_id）
 //   - 裸 `session` 同理（session_count / session_duration）
+//
 // 误判的代价是**有害**的：真值被抹掉，模型看不到差异内容就下不了判断。
 // 这两个词靠下面的限定规则处理（api_key / session_id）。
 var sensitiveWords = map[string]bool{
@@ -424,9 +426,10 @@ func valuePreview(v any) string {
 // 平台自己发请求会绕过整条管控链。
 //
 // 两种模式：
-//   a) 文件模式（file_a/file_b）：工具读文件直接算——零网络、零脚本。
-//   b) URL 模式（url_a/url_b）：工具在工作目录写出差分脚本，返回一条
-//      「取两段响应 + 做差分」的命令。
+//
+//	a) 文件模式（file_a/file_b）：工具读文件直接算——零网络、零脚本。
+//	b) URL 模式（url_a/url_b）：工具在工作目录写出差分脚本，返回一条
+//	   「取两段响应 + 做差分」的命令。
 func (t *ToolSet) diffResponses() actool.CoreTool {
 	return readTool(
 		"diff_responses",
@@ -441,18 +444,25 @@ func (t *ToolSet) diffResponses() actool.CoreTool {
 			"以及「这组差异是否支持可枚举」的判断。\n"+
 			"**差异本身不是漏洞**——工具已滤掉时间戳/trace id/随机串这类噪声，剩下的要你结合语义判断。",
 		obj(map[string]any{
-			"file_a":   str("响应 A 的文件路径（已取好的响应体；相对路径相对于本次 run 的工作目录）"),
-			"file_b":   str("响应 B 的文件路径"),
-			"url_a":    str("响应 A 的 URL（未取响应时用）"),
-			"url_b":    str("响应 B 的 URL"),
-			"header_a": str("请求 A 的认证头（如 'Authorization: Bearer xxx'，可选）"),
-			"header_b": str("请求 B 的认证头（可选）"),
-			"status_a": intp("响应 A 的状态码（知道就填，可选）"),
-			"status_b": intp("响应 B 的状态码（可选）"),
+			"file_a":     str("响应 A 的文件路径（已取好的响应体；相对路径相对于本次 run 的工作目录）"),
+			"file_b":     str("响应 B 的文件路径"),
+			"url_a":      str("响应 A 的 URL（未取响应时用）"),
+			"url_b":      str("响应 B 的 URL"),
+			"header_a":   str("请求 A 的认证头（如 'Authorization: Bearer xxx'，可选）"),
+			"header_b":   str("请求 B 的认证头（可选）"),
+			"user_agent": str("自定义 User-Agent（可选；省略则沿用 curl 默认 UA。仅 URL 模式（url_a/url_b）生效；对 A、B 两次请求同时生效，需要两侧不同 UA 请用 header_a/header_b 分别传 User-Agent——-H 优先于 -A；只覆盖 User-Agent 头，不改其它头；仅可打印 ASCII，≤1024 字节）"),
+			"status_a":   intp("响应 A 的状态码（知道就填，可选）"),
+			"status_b":   intp("响应 B 的状态码（可选）"),
 		}),
 		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			var a diffArgs
-			_ = json.Unmarshal(in, &a)
+			if err := json.Unmarshal(in, &a); err != nil {
+				return actool.Errorf("参数解析失败: " + err.Error()), nil
+			}
+			ua, uaErr := normalizeToolUserAgent(a.UserAgent)
+			if uaErr != nil {
+				return actool.Errorf(uaErr.Error()), nil
+			}
 
 			hasFiles := strings.TrimSpace(a.FileA) != "" && strings.TrimSpace(a.FileB) != ""
 			hasURLs := strings.TrimSpace(a.URLA) != "" && strings.TrimSpace(a.URLB) != ""
@@ -501,6 +511,7 @@ func (t *ToolSet) diffResponses() actool.CoreTool {
 			if err != nil {
 				return actool.Errorf("写出差分脚本失败: " + err.Error()), nil
 			}
+			a.UserAgent = ua
 			cmd := buildDiffScript(a, scriptPath, workDir)
 			return jsonResult(map[string]any{
 				"run_with_bash": cmd,
@@ -605,10 +616,26 @@ const diffScriptName = "resp_diff.py"
 //   - 状态码由 curl 的 -w '%{http_code}' 拿到，作为脚本参数传入。
 //   - URL/认证头都做 POSIX 单引号转义——认证头里常带引号。
 func buildDiffScript(a diffArgs, scriptPath, workDir string) string {
+	// issue #52：header 值过 normalizeHeaderValue（可打印 ASCII + 拒 @ 前缀），
+	// 防 CRLF 头注入与 curl @file 本地文件读取外泄。
+	if a.HeaderA != "" {
+		if _, err := normalizeHeaderValue(a.HeaderA); err != nil {
+			return "echo ERROR: header_a " + fmt.Sprintf("%q", err.Error())
+		}
+	}
+	if a.HeaderB != "" {
+		if _, err := normalizeHeaderValue(a.HeaderB); err != nil {
+			return "echo ERROR: header_b " + fmt.Sprintf("%q", err.Error())
+		}
+	}
 	bodyA := filepath.Join(workDir, "resp_a_body")
 	bodyB := filepath.Join(workDir, "resp_b_body")
 	fetch := func(url, header, out string) string {
-		parts := []string{"curl", "-sS", "--max-time", "20", "-o", quoteShell(out), "-w", "%{http_code}", quoteShell(url)}
+		parts := []string{"curl", "-sS", "--max-time", "20"}
+		if a.UserAgent != "" {
+			parts = append(parts, "-A", quoteShell(a.UserAgent))
+		}
+		parts = append(parts, "-o", quoteShell(out), "-w", "%{http_code}", quoteShell(url))
 		if strings.TrimSpace(header) != "" {
 			parts = append(parts, "-H", quoteShell(header))
 		}
@@ -621,7 +648,7 @@ func buildDiffScript(a diffArgs, scriptPath, workDir string) string {
 		quoteShell(scriptPath), quoteShell(bodyA), quoteShell(bodyB))
 }
 
-// quoteShell 用 POSIX 单引号包裹一个值（内部单引号按 '\'' 转义）。
+// quoteShell 用 POSIX 单引号包裹一个值（内部单引号按 '\” 转义）。
 func quoteShell(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }

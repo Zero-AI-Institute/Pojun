@@ -6,12 +6,12 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/chu0119/pojun/db"
-	"github.com/chu0119/pojun/intercept"
-	"github.com/chu0119/pojun/sidequestion"
 	"github.com/Autumn-27/norma/agentcore"
 	"github.com/Autumn-27/norma/harness"
 	"github.com/Autumn-27/norma/llm"
+	"github.com/chu0119/pojun/db"
+	"github.com/chu0119/pojun/intercept"
+	"github.com/chu0119/pojun/sidequestion"
 )
 
 // captureRun drives one agent turn-to-completion over Session.Prompt and emits a

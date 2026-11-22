@@ -41,7 +41,7 @@ const jsAuditScriptName = "js_audit.py"
 const jsAuditScript = `#!/usr/bin/env python3
 """js_audit: SPA/webpack 前端源码泄露审计。
 
-用法: python3 js_audit.py --out <outdir> <url1> [url2 ...]
+用法: python3 js_audit.py --out <outdir> [--ua <user-agent>] <url1> [url2 ...]
 url 可以是入口 HTML（提取 <script src>）或 .js 文件本体。
 每行输出一个 JSON 事件；最后一行 type=summary。仅标准库；
 http(s)_proxy 环境变量自动生效（流量走记录代理）；证书校验关闭（同 curl -k）。
@@ -63,6 +63,18 @@ UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.3
       "Accept": "*/*",
       "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
       "Accept-Encoding": "gzip, deflate"}
+
+# --ua 覆盖值：默认空，表示沿用上面的平台默认 UA。
+# 只替换 User-Agent，Accept/Accept-Language/Accept-Encoding 保持原值——
+# 换 UA 不应顺带改掉其余头，否则会制造新的头集不自洽。
+UA_OVERRIDE = ""
+
+def _headers():
+    if not UA_OVERRIDE:
+        return UA
+    h = dict(UA)
+    h["User-Agent"] = UA_OVERRIDE
+    return h
 
 _ctx = ssl.create_default_context()
 _ctx.check_hostname = False
@@ -119,7 +131,7 @@ def _decode(raw, enc, cap):
     return raw
 
 def fetch(url, cap=MAX_BYTES):
-    req = urllib.request.Request(url, headers=UA)
+    req = urllib.request.Request(url, headers=_headers())
     with _opener.open(req, timeout=15) as r:
         raw = r.read(cap + 1)
         return r.getcode(), _decode(raw, r.headers.get("Content-Encoding"), cap), r.geturl()
@@ -143,6 +155,14 @@ SECRET_PATTERNS = [
     ("jwt", re.compile(r'eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.')),
     ("ak_sk_kv", re.compile(r'(?:access[_-]?key|secret[_-]?key|api[_-]?key|apikey|app[_-]?secret|client[_-]?secret|private[_-]?key|access[_-]?token)["\']?\s*[:=]\s*["\']([A-Za-z0-9_\-/+=]{10,64})["\']', re.I)),
     ("internal_ip", re.compile(r'(?:10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|172\.(?:1[6-9]|2\d|3[01])\.\d+\.\d+)')),
+    # v0.4.93 扩充（能力域 #12）：云/第三方服务凭据与高熵赋值
+    ("gcp_sa", re.compile(r'"type"\s*:\s*"service_account"|"private_key"\s*:\s*"-----BEGIN')),
+    ("google_api_key", re.compile(r'AIza[0-9A-Za-z\-_]{35}')),
+    ("stripe_live", re.compile(r'sk_live_[0-9A-Za-z]{16,}|rk_live_[0-9A-Za-z]{16,}')),
+    ("sendgrid", re.compile(r'SG\.[A-Za-z0-9_\-]{22}\.[A-Za-z0-9_\-]{43}')),
+    ("github_pat", re.compile(r'ghp_[0-9A-Za-z]{36}|github_pat_[0-9A-Za-z_]{82}')),
+    ("slack_token", re.compile(r'xox[baprs]-[0-9A-Za-z\-]{10,}')),
+    ("generic_secret_kv", re.compile(r'(?:password|passwd|pwd|secret|token|credential)s?["\']?\s*[:=]\s*["\']([A-Za-z0-9_\-+/=!@#$%^&*]{12,})["\']', re.I)),
 ]
 
 def secret_scan(text, src):
@@ -314,6 +334,7 @@ def audit_js(url, outdir, seen_dirs):
     return (1 if found else 0), chunk_candidates(js, final), secrets_n + total, eps_n
 
 def main():
+    global UA_OVERRIDE
     args = sys.argv[1:]
     outdir = os.path.join(os.getcwd(), "jsmap")
     urls = []
@@ -321,6 +342,10 @@ def main():
     while i < len(args):
         if args[i] == "--out" and i + 1 < len(args):
             outdir = args[i + 1]
+            i += 2
+            continue
+        if args[i] == "--ua" and i + 1 < len(args):
+            UA_OVERRIDE = args[i + 1]
             i += 2
             continue
         urls.append(args[i])
@@ -362,10 +387,52 @@ def main():
         for cu in chunks:
             if cu not in fetched and cu not in queue and len(queue) < 14:
                 queue.append(cu)
+    osv_check(outdir)
     emit({"type": "summary", "js_audited": js_n, "sourcemaps_found": maps,
           "secret_signals": secrets_total, "endpoint_signals": ep_total, "dir": outdir,
           "next": "sourcemap found=true 的站点按 CWE-540 报 high（含真实密钥 critical）；"
                   "接口/路由清单 record_fact 并按 api-security-testing 继续"})
+
+def osv_check(dirpath):
+    """v0.4.93（能力域 #12）：扫描还原源码里的 package.json，依赖版本批量查 OSV。"""
+    deps = []
+    for root, _, files in os.walk(dirpath):
+        for fn in files:
+            if fn != "package.json":
+                continue
+            try:
+                pkg = json.load(open(os.path.join(root, fn), encoding="utf-8"))
+                for sec in ("dependencies", "devDependencies"):
+                    for name, ver in (pkg.get(sec) or {}).items():
+                        ver = str(ver).lstrip("^~>=< ")
+                        if ver and ver[0].isdigit():
+                            deps.append({"name": name, "version": ver})
+            except Exception:
+                continue
+    deps = list({(d["name"], d["version"]): d for d in deps}.values())[:100]
+    if not deps:
+        return
+    try:
+        queries = [{"package": {"ecosystem": "npm", "name": d["name"], "version": d["version"]}} for d in deps]
+        req = urllib.request.Request(
+            "https://api.osv.dev/v1/querybatch",
+            data=json.dumps({"queries": queries}).encode(),
+            headers={"Content-Type": "application/json"})
+        r = json.load(urllib.request.urlopen(req, timeout=30))
+        results = r.get("results", [])
+    except Exception as e:
+        emit({"type": "warn", "message": "OSV 查询失败（不影响主流程）: %s" % e})
+        return
+    hits = []
+    for d, res in zip(deps, results):
+        for v in (res.get("vulns") or [])[:5]:
+            hits.append({"package": d["name"], "version": d["version"],
+                         "id": v.get("id"), "summary": (v.get("summary") or v.get("details") or "")[:120]})
+    if hits:
+        emit({"type": "osv_vulns", "count": len(hits), "hits": hits[:20],
+              "note": "依赖版本命中 OSV 已知漏洞——确认组件确在目标运行时可达后按已知漏洞路径上报；先 record_fact"})
+    else:
+        emit({"type": "osv_clean", "checked": len(deps), "note": "依赖清单未命中 OSV 已知漏洞"})
 
 if __name__ == "__main__":
     main()
@@ -400,12 +467,20 @@ func (t *ToolSet) jsAudit() actool.CoreTool {
 				"items":       map[string]any{"type": "string"},
 				"description": "入口 URL 列表（1-6 个：入口 HTML 或具体 .js 文件）",
 			},
+			"user_agent": str("自定义 User-Agent（可选；省略则沿用平台默认 Chrome/131 Windows。只替换 User-Agent，Accept/Accept-Language/Accept-Encoding 保持原值；仅可打印 ASCII，≤1024 字节）"),
 		}, "urls"),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
-				URLs []string `json:"urls"`
+				URLs      []string `json:"urls"`
+				UserAgent string   `json:"user_agent"`
 			}
-			_ = json.Unmarshal(in, &a)
+			if err := json.Unmarshal(in, &a); err != nil {
+				return actool.Errorf("参数解析失败: " + err.Error()), nil
+			}
+			ua, uaErr := normalizeToolUserAgent(a.UserAgent)
+			if uaErr != nil {
+				return actool.Errorf(uaErr.Error()), nil
+			}
 			urls := make([]string, 0, len(a.URLs))
 			seen := map[string]bool{}
 			for _, u := range a.URLs {
@@ -428,11 +503,15 @@ func (t *ToolSet) jsAudit() actool.CoreTool {
 			}
 			quoted := make([]string, len(urls))
 			for i, u := range urls {
-				quoted[i] = "'" + strings.ReplaceAll(u, "'", `'\''`) + "'"
+				quoted[i] = quoteShell(u)
 			}
 			out := filepath.Join(t.runDir, "jsmap")
+			cmd := fmt.Sprintf("python3 %s --out %s %s", script, out, strings.Join(quoted, " "))
+			if ua != "" {
+				cmd = fmt.Sprintf("python3 %s --out %s --ua %s %s", script, out, quoteShell(ua), strings.Join(quoted, " "))
+			}
 			return jsonResult(map[string]any{
-				"run_with_bash": fmt.Sprintf("python3 %s --out %s %s", script, out, strings.Join(quoted, " ")),
+				"run_with_bash": cmd,
 				"count":         len(urls),
 				"note": "输出每行一个 JSON 事件（html/js/sourcemap/secrets/endpoints/warn/summary）。" +
 					"sourcemap found=true → CWE-540：还原源码落盘在 --out 目录，save_evidence 后报 high；" +

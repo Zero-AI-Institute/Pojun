@@ -46,8 +46,8 @@ const (
 // 而硬禁那条是新名字——它需要被**插入**（不是改名，否则就少了硬禁那条）。
 // 所以这里用「旧名 → 新名」表示改名，用 renameTargets 标记哪些需要改名。
 var oldRuleNames = map[string]string{
-	"[内置] SQL DROP DATABASE / SCHEMA":      "[内置] SQL DROP DATABASE / TABLE / SCHEMA",
-	"[内置] SQL DROP TABLE / INDEX / VIEW":   "[内置] SQL DROP DATABASE / TABLE / SCHEMA",
+	"[内置] SQL DROP DATABASE / SCHEMA":    "[内置] SQL DROP DATABASE / TABLE / SCHEMA",
+	"[内置] SQL DROP TABLE / INDEX / VIEW": "[内置] SQL DROP DATABASE / TABLE / SCHEMA",
 }
 
 // oldRulePatterns 记录部分规则在旧库里的 pattern。
@@ -60,7 +60,7 @@ var oldRuleNames = map[string]string{
 //  2. 迁移时把旧 pattern 换成新的（数据外泄规则换 pattern 是本次整改的一部分）。
 var oldRulePatterns = map[string]string{
 	"[内置] SQL DROP DATABASE / TABLE / SCHEMA": `(?i)\bDROP\s+(?:DATABASE|TABLE|SCHEMA|INDEX|VIEW|TABLESPACE|USER|ROLE)\b`,
-	"[内置] 数据外泄管道":                       `(?i)(curl|wget|nc|ncat)\b[^|]*\b(\|\s*(curl|wget|nc))`,
+	"[内置] 数据外泄管道":                             `(?i)(curl|wget|nc|ncat)\b[^|]*\b(\|\s*(curl|wget|nc))`,
 }
 
 // migrationSQL 是 migrateBuiltinRuleActions 实际执行的两条 UPDATE 的形状。
@@ -181,4 +181,3 @@ WHERE NOT EXISTS (SELECT 1 FROM intercept_rules WHERE name = $1)`,
 	}
 	return d.SetSetting(flag, "done")
 }
-

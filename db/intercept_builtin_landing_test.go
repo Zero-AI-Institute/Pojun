@@ -74,7 +74,6 @@ func TestSeededBuiltinRulesLandInDatabase(t *testing.T) {
 		counts[classHardDeny], counts[classJudge], counts[classAsk])
 }
 
-
 // 升级路径回归：v0.3.86 全新装（v4 flag 已置、规则已从目录移除）→ v0.3.87
 // 升级——V4 seed 必须把「启停回连接收器」规则按名补种回来（Kali 实测缺陷）。
 // 这里模拟该序列：置 flag → 删规则行 → 跑 V4 seed → 断言规则回来。

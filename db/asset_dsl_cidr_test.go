@@ -25,7 +25,7 @@ func TestValidateDSLAcceptsCidr(t *testing.T) {
 // cidr 的值必须是网段，不能是裸 IP 或乱码。
 func TestValidateDSLRejectsBadCidr(t *testing.T) {
 	for _, bad := range []string{
-		"cidr=10.10.70.17",     // 裸 IP，不是网段
+		"cidr=192.0.2.17",      // 裸 IP，不是网段
 		"cidr=not-a-network",   // 乱码
 		"cidr=10.10.0.0/16/24", // 多一段
 	} {

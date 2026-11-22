@@ -741,6 +741,11 @@ type steerHooks struct {
 	// repeats 是重复调用检测器（v0.4.28，PentAGI 机制自研）：同名工具+完全相同入参
 	// 连续 ≥3 次即拦截回喂纠正提示；同一串最多拦 2 次后放行兜底。nil = 不介入。
 	repeats *repeatTracker
+	// budgetHard 是意图预算 hard 模式（v0.4.92）的置位标志：超预算后对非收尾工具
+	// 一律拦截，只留 wrapup/写回类动作。nil = soft 模式或预算关闭。
+	budgetHard    *atomic.Bool
+	budgetLimit   int64
+	budgetMinutes int
 }
 
 // 空转回合(只有思考、既无正文也无工具调用)续跑次数的默认值，与 SDK 空响应重试的
@@ -780,6 +785,11 @@ func isThinkingOnlyTurn(messages []llm.Message) bool {
 func (h steerHooks) PreToolUse(ctx context.Context, name string, input []byte) (bool, string, []byte) {
 	// 重复调用检测（v0.4.28）：拦截优先级低于 steer 纠偏——先让排队的人类/规划者
 	// 指令说话，再查重复。
+	// 预算 hard 模式（v0.4.92）：置位后拦截一切非收尾工具，逼模型立即写回收尾。
+	if h.budgetHard != nil && h.budgetHard.Load() && !agent.IsSettlementAllowedTool(name) {
+		log.Printf("[work %s] 预算 hard 拦截：%s（非收尾工具）", h.label, name)
+		return true, budgetHardBlockText(h.budgetLimit, h.budgetMinutes), nil
+	}
 	if h.repeats != nil {
 		if streak, block := h.repeats.observe(name, input); block {
 			log.Printf("[work %s] 重复调用拦截：%s 连续第 %d 次完全相同入参", h.label, name, streak)
@@ -1489,9 +1499,12 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	workCtx = intercept.WithAutopilot(workCtx, t.AutopilotEnabled) // 自主推进提示词尾巴（worker）
 	// 意图级软预算（v0.4.28）：usage 活动的累计 token 到顶 → steer 注入收尾提醒（软的，
 	// 不杀进程，一次为准）；重复调用检测器挂进 steerHooks。两者都可经 settings 关闭/调整。
-	if bw := intentBudgetWatcher(intentBudgetFromPG(e.m.pg), func(msg string) error {
+	runStart := time.Now()                  // 意图墙钟起点（跨 model_error 重试累计，结算时落 payload）
+	budgetCfg := intentBudgetFromPG(e.m.pg) // 每意图读一次（v0.4.28 口径，settings 即时生效）
+	budgetHard := &atomic.Bool{}            // hard 模式置位（v0.4.92）：watcher 与 steerHooks 共享
+	if bw := intentBudgetWatcher(budgetCfg, func(msg string) error {
 		return e.SteerWork(iid, msg)
-	}, label); bw != nil {
+	}, label, runStart, func() { budgetHard.Store(true) }); bw != nil {
 		inner := emit
 		emit = func(a db.Activity) {
 			bw(a)
@@ -1538,8 +1551,10 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 		label:   label,
 		repeats: newRepeatTracker(),
 	}
+	if budgetCfg.HardMode {
+		hooks.budgetHard, hooks.budgetLimit, hooks.budgetMinutes = budgetHard, budgetCfg.Tokens, budgetCfg.Minutes
+	}
 	wTaskID, _ := strconv.ParseInt(t.ID, 10, 64)
-	runStart := time.Now() // 意图墙钟起点（跨 model_error 重试累计），结算时落 payload
 	e.BeginLLMCall(t.ID)
 	var reason harness.TerminalReason
 	var wrote agent.WriteCounts

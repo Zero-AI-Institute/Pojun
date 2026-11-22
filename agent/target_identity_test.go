@@ -1,10 +1,14 @@
 package agent
 
 import (
+	"context"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/chu0119/pojun/agent/validators"
 )
 
 // brandTokens 是不得出现在 **target-facing 产物** 里的平台/能力标识。
@@ -100,5 +104,58 @@ func TestSkillScriptsHaveNoBrand(t *testing.T) {
 			t.Fatalf("读取 %s: %v", f, err)
 		}
 		assertNoBrand(t, f, string(b))
+	}
+}
+
+// 工具描述是模型的写作素材（system prompt 组成部分）——描述里的品牌词会
+// 被模型顺手复用进载荷。枚举 worker 全量注册工具的 Description 断言。
+func TestToolDescriptionsHaveNoBrand(t *testing.T) {
+	ts := &ToolSet{}
+	for _, tool := range ts.WorkerTools() {
+		assertNoBrand(t, "tool desc "+tool.Name(), tool.Description())
+	}
+}
+
+// 技能方法论 markdown（SKILL.md 与 references/*.md）是模型可读素材——
+// 与技能脚本同等的泄漏面。
+func TestSkillMarkdownHaveNoBrand(t *testing.T) {
+	patterns := []string{
+		"../skills/*/SKILL.md",
+		"../skills/*/references/*.md",
+	}
+	total := 0
+	for _, pattern := range patterns {
+		files, err := filepath.Glob(pattern)
+		if err != nil {
+			t.Fatalf("glob %s: %v", pattern, err)
+		}
+		for _, f := range files {
+			total++
+			b, err := os.ReadFile(f)
+			if err != nil {
+				t.Fatalf("读取 %s: %v", f, err)
+			}
+			assertNoBrand(t, f, string(b))
+		}
+	}
+	if total < 40 {
+		t.Fatalf("技能 md 覆盖数异常（%d），glob 失效？", total)
+	}
+}
+
+// validators 探针载荷会作为参数值直接发向目标（URL 参数值/探针页面内容）——
+// 不得包含平台标识。
+func TestValidatorsProbesHaveNoBrand(t *testing.T) {
+	res := validators.RunRCE(context.Background(), http.DefaultClient, "http://t.invalid/a?q=1", "q", validators.NewToken())
+	for _, p := range res.Probes {
+		assertNoBrand(t, "rce probe "+p.Name, p.Injected)
+	}
+	res = validators.RunXSS(context.Background(), http.DefaultClient, "http://t.invalid/a?q=1", "q", validators.NewToken())
+	for _, p := range res.Probes {
+		assertNoBrand(t, "xss probe "+p.Name, p.Injected)
+	}
+	res = validators.RunSSRF(context.Background(), http.DefaultClient, "http://t.invalid/a?q=1", "q", validators.NewToken(), validators.SSRFOOB{})
+	for _, p := range res.Probes {
+		assertNoBrand(t, "ssrf probe "+p.Name, p.Injected)
 	}
 }

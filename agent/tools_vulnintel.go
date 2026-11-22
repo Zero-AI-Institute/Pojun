@@ -10,10 +10,10 @@ import (
 	"context"
 	"encoding/json"
 	"net"
-	"runtime"
-	"regexp"
-	"os/exec"
 	"net/url"
+	"os/exec"
+	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -68,7 +68,7 @@ func relatedSkillsFor(cwes []string) []string {
 }
 
 // vulnDetailWithSkills 在 VulnDetail 之上附带 skill 联动字段
-//（内嵌扁平序列化，无联动时字段缺失、形状与原来完全一致）。
+// （内嵌扁平序列化，无联动时字段缺失、形状与原来完全一致）。
 type vulnDetailWithSkills struct {
 	*vulnintel.VulnDetail
 	RelatedSkills []string `json:"related_skills,omitempty"`
@@ -101,7 +101,7 @@ func (t *ToolSet) searchVulns() actool.CoreTool {
 			// limit 是整数参数。之前误写成 obj(...)（嵌套对象），校验器于是要求
 			// 模型传 `limit: {}` —— 实测 41 次调用全部报
 			// "invalid tool input: limit: expected object"，这个工具等于废了一半。
-			"limit":   intp("返回条数上限(默认 20，最大 50)"),
+			"limit": intp("返回条数上限(默认 20，最大 50)"),
 		}, "product"),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
 			if vulnintelStore == nil {
@@ -254,17 +254,18 @@ func (t *ToolSet) searchRecentCritical() actool.CoreTool {
 				}
 			}
 			return jsonResult(map[string]any{
-				"count":                   len(hits),
-				"version_undetermined":   undet,
-				"vulnerabilities":         hits,
-				"note":                    "version_undetermined=true 的条目表示 NVD 未填受影响版本区间——不等于不受影响，优先查厂商 advisory 确认",
+				"count":                len(hits),
+				"version_undetermined": undet,
+				"vulnerabilities":      hits,
+				"note":                 "version_undetermined=true 的条目表示 NVD 未填受影响版本区间——不等于不受影响，优先查厂商 advisory 确认",
 			})
 		},
 	)
 }
 
 // getPoc exposes aggregated PoC/EXP entries for one CVE.
-func (t *ToolSet) getPoc() actool.CoreTool {	return readTool(
+func (t *ToolSet) getPoc() actool.CoreTool {
+	return readTool(
 		"get_poc",
 		"取单条已知漏洞的【现成 PoC/利用】聚合：GitHub 上引用该 CVE 的公开仓库，"+
 			"按星数排序。先 search_vulns 确认漏洞存在，再 get_poc 找现成弹药；返回的是"+
@@ -295,7 +296,6 @@ func (t *ToolSet) getPoc() actool.CoreTool {	return readTool(
 		},
 	)
 }
-
 
 // nucleiSeverityRE 限定 severity 参数形态，避免把任意文本拼进命令行。
 var nucleiSeverityRE = regexp.MustCompile(`^(?i)(critical|high|medium|low|info)(,(critical|high|medium|low|info))*$`)

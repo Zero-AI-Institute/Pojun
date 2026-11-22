@@ -740,14 +740,15 @@ func (s *AssetStore) UpsertHTTPService(req UpsertHTTPServiceReq) (int64, error) 
 INSERT INTO assets(
     type, url, service_type, service_name, domain, ip, port, root_domain,
     c_segment, favicon_mmh3, technologies, status_code, content_length, page_title,
-    auth, company_id, company_source, task_ids
+    auth, company_id, company_source, task_ids, simhash
 )
 VALUES (
     'service', $1, 'http', $2, $3, $4, $5, $6,
     $7::cidr, $8, $9::text[], $10, $11, $12,
-    $13::jsonb[], $14, 'scope', $15::bigint[]
+    $13::jsonb[], $14, 'scope', $15::bigint[], $16
 )
 ON CONFLICT (url) WHERE type = 'service' AND service_type = 'http' DO UPDATE SET
+    simhash        = COALESCE(NULLIF(EXCLUDED.simhash, 0), assets.simhash),
     status_code    = COALESCE(EXCLUDED.status_code,    assets.status_code),
     content_length = COALESCE(EXCLUDED.content_length, assets.content_length),
     page_title     = COALESCE(EXCLUDED.page_title,     assets.page_title),
@@ -775,7 +776,7 @@ ON CONFLICT (url) WHERE type = 'service' AND service_type = 'http' DO UPDATE SET
 RETURNING id`,
 		normURL, serviceName, domainVal, ipVal, nullableInt(port), rootDomain,
 		csegVal, faviconVal, techsArr, req.StatusCode, req.ContentLength, titleVal,
-		authJSON, companyID, taskIDs,
+		authJSON, companyID, taskIDs, URLStructureSimhash(req.URL, req.PageTitle, derefI64(req.ContentLength)),
 	).Scan(&id)
 	if err != nil {
 		return 0, err

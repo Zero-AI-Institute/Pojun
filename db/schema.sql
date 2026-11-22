@@ -463,6 +463,33 @@ ALTER TABLE llm_profiles ADD  CONSTRAINT llm_profiles_retry_check CHECK (
 -- 预设。仅展示/向导关联用途，不参与 provider 构建；'' = 手动配置或旧数据。
 ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS preset_id TEXT NOT NULL DEFAULT '';
 
+-- 资产 URL 结构指纹（v0.4.94 经验层）：64-bit simhash（路径段归一+参数名+title/长度
+-- 分桶），同 root_domain 下汉明距离近的 endpoint 归同簇，供变体分析找同类端点。
+ALTER TABLE assets ADD COLUMN IF NOT EXISTS simhash BIGINT NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS idx_assets_root_simhash ON assets(root_domain, type, simhash) WHERE simhash <> 0;
+
+-- Playbook 武器库（v0.4.94 经验层）：validator PASS 的 critical/high 上报自动沉淀
+-- 成功攻击链快照；同类目标（同技术栈/同根域）派意图时按 Top3 注入 planner 态势。
+CREATE TABLE IF NOT EXISTS playbooks (
+    id          BIGSERIAL PRIMARY KEY,
+    name        TEXT NOT NULL DEFAULT '',
+    key         TEXT NOT NULL DEFAULT '',
+    vulnclass   TEXT NOT NULL DEFAULT '',
+    severity    TEXT NOT NULL DEFAULT '',
+    root_domain TEXT NOT NULL DEFAULT '',
+    techs       TEXT[] NOT NULL DEFAULT '{}',
+    url_pattern TEXT NOT NULL DEFAULT '',
+    steps       JSONB NOT NULL DEFAULT '[]',
+    finding_id  BIGINT,
+    task_id     BIGINT,
+    used_count  INTEGER NOT NULL DEFAULT 1,
+    last_used_at TIMESTAMPTZ,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_playbooks_key ON playbooks(key, root_domain);
+CREATE INDEX IF NOT EXISTS idx_playbooks_tech ON playbooks USING gin(techs);
+
+
 -- 思考开关字段 thinking_type，从旧的单一 reasoning_effort 语义一次性拆分而来。
 -- schema.sql 每次启动都执行，故迁移必须只跑一次：仅当该列尚不存在时才回填，
 -- 否则每次启动都会把用户后来手动设的组合覆盖回去。旧 reasoning_effort 语义：

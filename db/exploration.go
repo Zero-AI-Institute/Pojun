@@ -329,6 +329,15 @@ func (s *ExplorationStore) SetNodeState(id int64, state string) error {
 // token，有实测依据），但那本质是"声称达成"而不是"被证据证明"。把区别写进
 // payload 的合并字段里，报告与界面才能如实呈现，而不是让一次偷懒的收官看起来
 // 和验证过的达成一样。
+// MergeGoalPayload 合并字段进 goal 节点的 payload（jsonb ||，v0.4.96 proof 落库用）。
+func (s *ExplorationStore) MergeGoalPayload(id int64, fields map[string]any) error {
+	raw, _ := json.Marshal(fields)
+	_, err := s.db.Exec(`UPDATE exploration_nodes
+SET payload = COALESCE(payload,'{}'::jsonb) || $1::jsonb
+WHERE id=$2 AND exploration_id=$3 AND kind='goal'`, string(raw), id, s.expID)
+	return err
+}
+
 func (s *ExplorationStore) MarkGoalUnverified(id int64, reason string) error {
 	raw, _ := json.Marshal(map[string]any{
 		"unverified":        true,

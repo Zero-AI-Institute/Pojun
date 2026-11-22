@@ -521,8 +521,10 @@ func streamTaskLLM(ctx context.Context, taskID string, req llm.CompletionRequest
 }
 
 func streamEventCommitsOutput(event llm.StreamEvent) bool {
+	// v0.4.96（内部版 v0.9.50）：SEThinkingDelta 不算已提交——思考增量丢失可
+	// 重生成，重放无害；正文/工具调用才算提交，thinking 后断流仍可安全重放。
 	switch event.Type {
-	case llm.SETextDelta, llm.SEThinkingDelta, llm.SEToolInputJSON:
+	case llm.SETextDelta, llm.SEToolInputJSON:
 		return event.Text != ""
 	case llm.SEToolUseStart, llm.SEMessageDelta, llm.SEMessageStop:
 		return true

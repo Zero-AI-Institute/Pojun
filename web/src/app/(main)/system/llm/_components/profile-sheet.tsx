@@ -115,7 +115,9 @@ export function ProfileSheet({
   const [apiKey, setApiKey] = React.useState("");
   const [keyHint, setKeyHint] = React.useState("");
   const [cw, setCw] = React.useState("0"); // 上下文窗口(K tokens)
-  const [cwTouched, setCwTouched] = React.useState(false); // 用户手动改过就不再被自动推断覆盖
+  const [cwTouched, setCwTouched] = React.useState(false);
+  const [mtfTouched, setMtfTouched] = React.useState(false);
+  const [maxTokensTouched, setMaxTokensTouched] = React.useState(false); // 用户手动改过就不再被自动推断覆盖
   const [presetIdStore, setPresetIdStore] = React.useState("");
   // ── 高级字段（两种模式共用） ──
   const [rps, setRps] = React.useState("0");
@@ -178,7 +180,9 @@ export function ProfileSheet({
     setPoolExclude(p?.pool_exclude ?? false);
     setStreaming(p?.streaming ?? true);
     setMaxTokens(String(p?.max_tokens ?? 0));
+    setMaxTokensTouched(false);
     setMaxTokensField(fromStore(p?.max_tokens_field));
+    setMtfTouched(false);
     setSessionHeaderKey(p?.session_header_key ?? "");
     setUserAgent(p?.user_agent ?? "");
     setRetry(p?.retry ?? ZERO_OVERRIDE);
@@ -254,10 +258,22 @@ export function ProfileSheet({
   async function pickModel(m: string) {
     setModel(m);
     setModelsOpen(false);
-    if (cwTouched) return;
     try {
       const meta = await api.llmModelMeta(m);
-      if (meta.source !== "none" && meta.context_k > 0) setCw(String(meta.context_k));
+      // context 自动填（用户手动改过则不覆盖）
+      if (!cwTouched && meta.source !== "none" && meta.context_k > 0) setCw(String(meta.context_k));
+      // 上限字段名自动推断（v0.4.93）：openai 格式 + reasoning 模型 → max_completion_tokens
+      if (!mtfTouched && format === "openai" && meta.reasoning) setMaxTokensField("max_completion_tokens");
+      // 模型级参数覆盖（v0.4.96，对照内部版 v0.9.64）：选中的列表模型自带预设级参数时应用
+      const me = activePreset?.models.find((mm) => mm.id.toLowerCase() === m.toLowerCase());
+      if (me) {
+        if (!cwTouched && me.context_k > 0) setCw(String(me.context_k));
+        if (me.max_tokens) setMaxTokens(String(me.max_tokens));
+        if (me.max_tokens_field) setMaxTokensField(fromStore(me.max_tokens_field));
+        if (me.thinking_type) setThinkingType(fromStore(me.thinking_type));
+        if (me.reasoning_effort) setEffort(fromStore(me.reasoning_effort));
+        if (me.user_agent) setUserAgent(me.user_agent);
+      }
     } catch {
       /* 推断失败静默：不影响手填 */
     }
@@ -392,6 +408,16 @@ export function ProfileSheet({
     setPresetIdStore(p.id);
     setFormat(p.format);
     setBaseUrl(p.base_url);
+    // 差异化 profile 参数预置（v0.4.93）：会话头/UA/上限字段名随预设带入，
+    // 「填 Key 即可用」——用户不必进高级设置手动配。
+    setSessionHeaderKey(p.session_header_key ?? "");
+    setUserAgent(p.user_agent ?? "");
+    setMaxTokensField(p.max_tokens_field ? fromStore(p.max_tokens_field) : NONE);
+    setMtfTouched(false);
+    setMaxTokens(p.max_tokens ? String(p.max_tokens) : "");
+    setMaxTokensTouched(false);
+    setThinkingType(fromStore(p.thinking_type));
+    setEffort(fromStore(p.reasoning_effort));
     // 名称自动带出（当前没起名或起的正是某预设名时才覆盖）
     if (!name.trim() || presets.some((x) => x.name === name.trim())) setName(p.name);
     setModels([]); // 换厂商后旧列表失效
@@ -621,7 +647,10 @@ export function ProfileSheet({
             <Label htmlFor="p-mtf">输出上限字段名（仅 OpenAI 协议）</Label>
             <Select
               value={maxTokensField}
-              onValueChange={setMaxTokensField}
+              onValueChange={(v) => {
+                setMaxTokensField(v);
+                setMtfTouched(true);
+              }}
               disabled={format !== "openai"}
             >
               <SelectTrigger id="p-mtf">

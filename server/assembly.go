@@ -290,6 +290,51 @@ func wireTools(pg *db.DB, domainReg map[string]actool.CoreTool) {
 	agent.FindingTrafficBindingEnabled = func() bool { return pg.GetBool(settingAgentTrafficBinding, false) }
 	// 证据附件列表（v0.4.9）：agent 的 list_artifacts 工具读取本任务已登记附件。
 	agent.ListTaskArtifacts = func(taskID string) ([]db.TaskArtifact, error) { return pg.ListTaskArtifacts(taskID) }
+	// 经验层（v0.4.94）：playbook 捕获/匹配与变体派发的 db 通道。
+	if err := pg.EnsurePlaybookSchema(); err != nil {
+		log.Printf("[playbook] schema 初始化失败: %v", err)
+	}
+	agent.CapturePlaybookFn = func(taskID int64, findingID int64, marker string) (int64, error) {
+		return pg.CapturePlaybook(taskID, findingID, marker)
+	}
+	agent.FindingAssetInfoFn = func(findingID int64) (string, int64, []string, string, int64, bool) {
+		var assetIDsJSON []byte
+		if err := pg.QueryRow(`SELECT asset_ids FROM findings WHERE id=$1`, findingID).Scan(&assetIDsJSON); err != nil {
+			return "", 0, nil, "", 0, false
+		}
+		var ids []int64
+		if json.Unmarshal(assetIDsJSON, &ids) != nil || len(ids) == 0 {
+			return "", 0, nil, "", 0, false
+		}
+		var rootDomain, url string
+		var techs []string
+		var simhash int64
+		var assetID int64
+		if err := pg.QueryRow(`SELECT COALESCE(root_domain,''), COALESCE(simhash,0), COALESCE(technologies,'{}'::text[]), COALESCE(url,''), id FROM assets WHERE id=$1`, ids[0]).
+			Scan(&rootDomain, &simhash, &techs, &url, &assetID); err != nil || assetID == 0 {
+			return "", 0, nil, "", 0, false
+		}
+		return rootDomain, simhash, techs, url, assetID, true
+	}
+	agent.SimilarEndpointsFn = func(rootDomain string, simhash int64, excludeID int64, limit int) ([]db.Asset, error) {
+		return pg.SimilarHTTPEndpoints(rootDomain, simhash, excludeID, limit)
+	}
+	agent.MatchPlaybooksFn = func(vulnClass string, techs []string, rootDomain string, limit int) []db.Playbook {
+		return pg.MatchPlaybooks(vulnClass, techs, rootDomain, limit)
+	}
+	agent.TaskRootAndTechsFn = func(taskID int64) (string, []string) {
+		var rootDomain string
+		if err := pg.QueryRow(`SELECT COALESCE(root_domain,'') FROM assets WHERE task_ids @> ARRAY[$1::bigint] AND root_domain <> '' LIMIT 1`, taskID).Scan(&rootDomain); err != nil {
+			return "", nil
+		}
+		var techs []string
+		if err := pg.QueryRow(`SELECT COALESCE(array_agg(DISTINCT t), '{}') FROM unnest((SELECT array_agg(technologies) FROM assets WHERE task_ids @> ARRAY[$1::bigint] AND technologies <> '{}')) AS t`, taskID).Scan(&techs); err != nil {
+			techs = nil
+		}
+		return rootDomain, techs
+	}
+	agent.VariantIntentsEnabledFn = func() bool { return variantIntentsFromPG(pg) }
+	agent.PlaybookInjectEnabledFn = func() bool { return playbookInjectFromPG(pg) }
 	agent.TaskArtifactQuota = func(taskID string) (count int, bytes int64, maxCount int, maxBytes int64) {
 		count, bytes, _ = pg.CountTaskArtifacts(taskID)
 		maxCount, maxBytes = pg.ArtifactQuota()

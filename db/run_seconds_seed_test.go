@@ -84,7 +84,10 @@ func TestApplyAgentRunSecondsOnlyTouchesMatchingRows(t *testing.T) {
 	}
 	defer d.Close()
 
-	rows := []struct{ key string; secs int }{
+	rows := []struct {
+		key  string
+		secs int
+	}{
 		{"runsec_keep_a", 900},  // 用户自调 → 不动
 		{"runsec_move_b", 3600}, // 旧默认值 → 改成 1200
 	}

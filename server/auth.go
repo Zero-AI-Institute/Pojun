@@ -161,6 +161,18 @@ const (
 	loginFailureMinDelay = 300 * time.Millisecond // 失败响应的人为下限，抹平时序差
 )
 
+// perIPLocked 只查 per-IP 锁（不含全局）——authLogin 的「全局锁下正确密码仍尝试
+// 一次」路径需要区分这两种锁。
+func (l *loginLimiter) perIPLocked(ip string) (bool, time.Duration) {
+	now := time.Now()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if until, ok := l.lockedUntil[ip]; ok && now.Before(until) {
+		return true, until.Sub(now)
+	}
+	return false, 0
+}
+
 func (l *loginLimiter) allow(ip string) (bool, time.Duration) {
 	now := time.Now()
 	l.mu.Lock()
@@ -216,6 +228,22 @@ func (l *loginLimiter) recordSuccess(ip string) {
 	defer l.mu.Unlock()
 	delete(l.fails, ip)
 	delete(l.lockedUntil, ip)
+	// v0.4.96（内部版 v0.9.56）：登录成功同时清全局计数——正确密码证明身份，
+	// 撞库造成的全局锁不应继续挡住已证明的管理员。
+	l.globalFails = nil
+	l.globalUntil = time.Time{}
+}
+
+// globallyLocked 报告全局锁是否存活及剩余时长（authLogin 的「全局锁下正确密码
+// 仍尝试一次」路径用）。
+func (l *loginLimiter) globallyLocked() (bool, time.Duration) {
+	now := time.Now()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if now.Before(l.globalUntil) {
+		return true, l.globalUntil.Sub(now)
+	}
+	return false, 0
 }
 
 // loginGuard 统一包住 login/init 的防爆破语义：超限直接 429，失败记一笔并
@@ -510,7 +538,12 @@ func (s *Server) authChangePassword(w http.ResponseWriter, r *http.Request) {
 
 // POST /api/auth/login — validates username/password and returns a JWT.
 func (s *Server) authLogin(w http.ResponseWriter, r *http.Request) {
-	if !loginGuard(w, r, "login") {
+	// v0.4.96（内部版 v0.9.56）：per-IP 锁前置硬挡；全局锁存活时仍执行一次密码
+	// 校验——正确密码证明身份并清全局锁放行，错误密码才 429。否则撞库流量可以在
+	// 全局锁窗口内把管理员永久挡在门外（DoS 管理员）。
+	globalLocked, globalWait := loginLimit.globallyLocked()
+	if ipLocked, ipWait := loginLimit.perIPLocked(clientIP(r)); ipLocked {
+		writeErr(w, 429, fmt.Sprintf("尝试过于频繁（IP 锁定 %s），请稍后再试", ipWait.Truncate(time.Second)))
 		return
 	}
 	pg := s.pg(w)
@@ -539,6 +572,14 @@ func (s *Server) authLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(req.Password)); err != nil {
+		if globalLocked {
+			// 全局锁存活：错误密码只记 per-IP 失败并 429（不延长全局锁，防攻击者
+			// 用垃圾请求永久续锁）；正确的密码已在上方路径被放行。
+			loginLimit.recordFail(clientIP(r))
+			time.Sleep(loginFailureMinDelay)
+			writeErr(w, 429, fmt.Sprintf("尝试过于频繁（全局锁定 %s）——正确的密码会在下一次尝试时放行", globalWait.Truncate(time.Second)))
+			return
+		}
 		loginGuard(w, r, "login-fail")
 		writeErr(w, 401, "用户名或密码错误")
 		return

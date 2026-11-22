@@ -45,6 +45,8 @@ var (
 	evMaskRE       = regexp.MustCompile(`(\*{3,}|\[redacted\]|已脱敏|打码|masked|x{4,})`)
 	evCountRE      = regexp.MustCompile(`(?i)(?:共|总计|合计|total|count|rows?|records?)?\s*(\d{2,})\s*(?:条|行|个|records?|rows?|users?|orders?|items?)`)
 	evCmdExecRE    = regexp.MustCompile(`(?i)(uid=\d+|whoami|hostname|/etc/passwd|nt authority\\system|root@|administrator|命令执行回显|id\s*[:=]\s*\d+)`)
+	// 机验标记（v0.4.92）：validate_finding 输出的 PASS 标记，token 为 8 位 hex。
+	evMachineVerifyRE = regexp.MustCompile(`validate:[0-9a-f]{8}:pass`)
 )
 
 func hasAny(s string, words ...string) bool {
@@ -100,6 +102,9 @@ func ReviewEvidence(severity, vulnclass, evidence string) EvidenceReview {
 	cmdExec := evCmdExecRE.MatchString(lower)
 	impact := impactRead || (writeTest && writeReadback) || permission || cmdExec
 
+	// 机验标记：validate_finding 输出的 PASS 标记（token 为 8 位 hex）。
+	machineVerify := evMachineVerifyRE.MatchString(evidence)
+
 	mk := func(id, label string, ok bool, required bool, detail string) EvidenceCheck {
 		return EvidenceCheck{ID: id, Label: label, OK: ok, Required: required, Detail: detail}
 	}
@@ -117,6 +122,9 @@ func ReviewEvidence(severity, vulnclass, evidence string) EvidenceReview {
 		mk("permission", "权限矩阵/越权对照", permission, strings.Contains(vc, "越权") || strings.Contains(vc, "未授权") || strings.Contains(vc, "权限") || strings.Contains(vc, "idor"), "列出匿名/普通用户/管理员等身份对同一接口的响应差异"),
 		mk("artifact", "证据附件/哈希", artifact, false, "大数据集/截图用 save_evidence 登记，记录 sha256 与 artifact id"),
 		mk("traffic", "流量证据绑定（baseline/proof）", traffic, false, "HTTP 漏洞建议绑定 baseline 与 proof 两条真实流量"),
+		// 机验项（v0.4.92）：evidence 含 validate_finding 的 PASS 标记（validate:<token>:pass）。
+		// 非必过、只加分——validator 覆盖面有限（v1 仅 RCE/XSS/SSRF），不能当门槛。
+		mk("machine_verify", "程序化验证标记（validate_finding PASS）", machineVerify, false, "用 validate_finding 工具跑程序化验证，把输出的 validate:<token>:pass 标记引用进 evidence"),
 	}
 
 	requiredCount, passedRequired := 0, 0

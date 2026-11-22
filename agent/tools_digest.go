@@ -12,8 +12,8 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/chu0119/pojun/db"
 	actool "github.com/Autumn-27/norma/tool"
+	"github.com/chu0119/pojun/db"
 )
 
 // digestMemberEntry builds the compact per-member view expand_digest returns —

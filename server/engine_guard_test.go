@@ -2,6 +2,7 @@ package server
 
 import (
 	"testing"
+	"time"
 
 	"github.com/chu0119/pojun/db"
 )
@@ -54,7 +55,7 @@ func TestIntentBudgetWatcher(t *testing.T) {
 
 	var msgs []string
 	steer := func(m string) error { msgs = append(msgs, m); return nil }
-	w := intentBudgetWatcher(intentBudgetConfig{Enabled: true, Tokens: 1000}, steer, "test")
+	w := intentBudgetWatcher(intentBudgetConfig{Enabled: true, Tokens: 1000}, steer, "test", time.Now(), nil)
 	if w == nil {
 		t.Fatal("watcher must be non-nil when enabled")
 	}
@@ -79,7 +80,7 @@ func TestIntentBudgetWatcher(t *testing.T) {
 	w(db.Activity{Kind: "tool_use"})
 
 	// 关闭时不产生 watcher。
-	if intentBudgetWatcher(intentBudgetConfig{Enabled: false, Tokens: 1000}, steer, "test") != nil {
+	if intentBudgetWatcher(intentBudgetConfig{Enabled: false, Tokens: 1000}, steer, "test", time.Now(), nil) != nil {
 		t.Fatal("disabled budget must return nil watcher")
 	}
 }

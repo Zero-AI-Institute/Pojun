@@ -316,7 +316,11 @@ func (c Config) NewProvider() (llm.Provider, error) {
 		return nil, err
 	}
 	// 误拒答自愈：包装后只改「重试请求的授权说明」，不改意图与工具权限。
-	return GuardRefusal(prov), nil
+	prov = GuardRefusal(prov)
+	// 流空闲看门狗（v0.4.96，内部版 v0.9.50）：LLM 网关偶发断流——180s 无事件
+	// 主动断开，错误冒泡为可重试瞬时故障，由 task_llm 重试层承接重放。
+	prov = WithStreamIdleWatchdog(prov, defaultStreamIdleTimeout)
+	return prov, nil
 }
 
 // IsQuotaExhaustedMessage deliberately recognizes only explicit balance,

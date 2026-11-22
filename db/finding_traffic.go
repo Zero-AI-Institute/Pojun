@@ -386,10 +386,10 @@ var findingBrackets = regexp.MustCompile(`[（(【\[][^）)】\]]*[）)】\]]`)
 // 没有资产锚定时，旧指纹退化为「类别|名称」，不同端点/参数的同类漏洞会被合并；
 // 有了定位键就能区分，同时仍把「同一漏洞换证据再报一次」合并掉。
 var (
-	findingCVERe  = regexp.MustCompile(`(?i)\bCVE-\d{4}-\d{4,}\b`)
+	findingCVERe = regexp.MustCompile(`(?i)\bCVE-\d{4}-\d{4,}\b`)
 	// 排除字符同时覆盖半角与全角标点。此前未排除全角左括号（U+FF08），
 	// 「http://host（说明文字」会被整段吞进 URL，导致解析失败并产生垃圾键。
-	findingURLRe = regexp.MustCompile(`(?i)https?://[^\s"'<>（）()【】\[\]，,。；;]+`)
+	findingURLRe  = regexp.MustCompile(`(?i)https?://[^\s"'<>（）()【】\[\]，,。；;]+`)
 	findingPathRe = regexp.MustCompile(`(/[a-zA-Z0-9_\-./]{3,})`)
 	findingPortRe = regexp.MustCompile(`(?i)(?:端口|port)\s*[:=]?\s*(\d{1,5})`)
 )

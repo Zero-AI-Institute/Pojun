@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/chu0119/pojun/db"
 	actool "github.com/Autumn-27/norma/tool"
+	"github.com/chu0119/pojun/db"
 )
 
 func callReadJSON(t *testing.T, tool actool.CoreTool, input string) any {

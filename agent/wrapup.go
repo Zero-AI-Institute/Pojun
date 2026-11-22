@@ -115,6 +115,17 @@ func settlementDisabledTools() []string {
 	return out
 }
 
+// IsSettlementAllowedTool 报告 hard 预算模式（v0.4.92）下是否放行该工具：
+// settlement 时被禁用的执行类工具全部拦截，写回/答复类放行。
+func IsSettlementAllowedTool(name string) bool {
+	for _, d := range settlementDisabledTools() {
+		if d == name {
+			return false
+		}
+	}
+	return true
+}
+
 func wrapupSettlement(agentKey string, disabledTools []string) *harness.Settlement {
 	return &harness.Settlement{
 		Prompt:        resolveWrapup(agentKey),

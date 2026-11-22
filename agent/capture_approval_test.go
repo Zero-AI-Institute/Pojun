@@ -5,13 +5,13 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/chu0119/pojun/db"
-	"github.com/chu0119/pojun/guard"
-	"github.com/chu0119/pojun/intercept"
 	"github.com/Autumn-27/norma/agentcore"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/permission"
 	"github.com/Autumn-27/norma/tool"
+	"github.com/chu0119/pojun/db"
+	"github.com/chu0119/pojun/guard"
+	"github.com/chu0119/pojun/intercept"
 )
 
 // Exercise the actual SDK event -> hook -> execution -> result path. No real

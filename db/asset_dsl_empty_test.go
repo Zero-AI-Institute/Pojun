@@ -8,7 +8,7 @@ import (
 // 空值查询：agent 要能查出「端口开着但服务未识别」的资产。
 //
 // 背景：实测任务里 2380 个 service 资产有 2073 个 service_name 为空
-//（扫了端口但没做服务识别），而这些正是下一步该挖的面。agent 必须能
+// （扫了端口但没做服务识别），而这些正是下一步该挖的面。agent 必须能
 // 看见它们——但 `service_name=` 是模糊匹配（ILIKE '%%' 匹配所有非空值），
 // `service_name==""` 才是精确匹配空串。
 func TestDSLEmptyValueQuery(t *testing.T) {

@@ -263,7 +263,7 @@ export function FindingsTable({
                       title={f.task_description}
                     >
                       {/* 任务 id 必须显示且不能被截断掉——两个任务的名字可能
-                          前缀完全相同（实测两条都以「安康职业技术学院」开头），
+                          前缀完全相同（长任务名场景），
                           列宽又只有 w-32，只显示描述的话两行看起来一模一样，
                           根本分不清这条发现属于哪个任务。 */}
                       <span className="shrink-0 font-mono text-xs">#{f.task_id}</span>

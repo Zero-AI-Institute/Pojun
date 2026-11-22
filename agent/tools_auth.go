@@ -270,11 +270,15 @@ func buildAuthCurl(rawURL, method, body, extraHeader string, e authEntry) (strin
 		parts = append(parts, "-u", q(e.Username))
 	}
 
+	// issue #52：header 值过 normalizeHeaderValue（可打印 ASCII + 拒 @ 前缀）。
 	if strings.TrimSpace(extraHeader) != "" {
 		for _, line := range strings.Split(extraHeader, "\n") {
 			line = strings.TrimSpace(line)
 			if line == "" {
 				continue
+			}
+			if _, err := normalizeHeaderValue(line); err != nil {
+				return "", fmt.Errorf("header 校验失败: %v", err)
 			}
 			parts = append(parts, "-H", q(line))
 		}

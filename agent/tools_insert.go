@@ -744,6 +744,11 @@ func (t *ToolSet) WorkerTools() []actool.CoreTool {
 		t.authRequest(),
 		// evidence_check（v0.4.71）：复核高/危漏洞证据是否足以支撑危害结论（13 项检查 + src_ready）。
 		t.evidenceCheck(),
+		// validate_finding（v0.4.92）：按类别跑程序化验证探针（XBOW validators 范式），
+		// 输出机验标记 validate:<token>:pass 引用进 evidence 完成机验闭环。
+		t.validateFinding(),
+		// read_output（v0.4.92）：SDK 超长输出落盘文件的按行窗口回读（省 token）。
+		t.readOutput(),
 		// 原生 HTTP 执行器 + 会话复用（红队版 v0.7.0 下放）：直接发请求拿结构化结果，
 		// 登录态进任务级 cookie jar 跨意图复用——「登录→越权→回读」成为基本能力。
 		t.httpRequest(), t.sessionLogin(),

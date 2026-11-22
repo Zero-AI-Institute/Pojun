@@ -248,7 +248,7 @@ func TestHardDenyRulesDoNotFalsePositiveOnRealCommands(t *testing.T) {
 		{"REST 路径枚举", `for path in /api/ /api/users /api/login /api/status /api/config /api/health /api/version; do curl -s -o /dev/null -w "%{http_code}" "http://10.10.47.11:6969$path"; done`},
 		{"云平台 API 枚举", `for action in GetZones QueryZone CreateVm StartVm StopVm RebootVm DestroyVm; do curl -s "http://10.10.47.11:8080/?Action=$action"; done`},
 		{"nmap 脚本目录探测", `touch /usr/share/nmap/scripts/_t.nse 2>&1 && echo WRITABLE && rm -f /usr/share/nmap/scripts/_t.nse`},
-		{"端口连通性探测", `for ip in 10.10.70.1 10.10.70.254; do timeout 3 ping -c1 -W1 $ip >/dev/null 2>&1 && echo "$ip up"; done`},
+		{"端口连通性探测", `for ip in 192.0.2.10 192.0.2.254; do timeout 3 ping -c1 -W1 $ip >/dev/null 2>&1 && echo "$ip up"; done`},
 		{"Windows 主机接口探测", `for p in /getPreLoginData/ /login.cgi /webacs/; do curl -s "https://172.24.0.14$p"; done`},
 	}
 

@@ -6,14 +6,14 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/chu0119/pojun/db"
-	"github.com/chu0119/pojun/guard"
-	"github.com/chu0119/pojun/intercept"
 	"github.com/Autumn-27/norma/agentcore"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
 	"github.com/Autumn-27/norma/transcript"
+	"github.com/chu0119/pojun/db"
+	"github.com/chu0119/pojun/guard"
+	"github.com/chu0119/pojun/intercept"
 )
 
 // ChatAgent is the generic, task-independent conversational runner behind the chat

@@ -33,28 +33,29 @@ func validateFindingEvidence(severity, evidence string) string {
 type EvidenceGrade int
 
 const (
-	EvidenceNone      EvidenceGrade = iota // 没有机械验证凭据
-	EvidenceVersion                        // 只有版本/banner 匹配（不可靠：发行版 backport 不改版本号）
-	EvidenceBehavior                       // 有行为级验证（nuclei 命中/HTTP 200+特征/CVSS 触发）
-	EvidenceReplay                         // 有可复现回放（curl 命令+响应、截图、流量 ID）
+	EvidenceNone     EvidenceGrade = iota // 没有机械验证凭据
+	EvidenceVersion                       // 只有版本/banner 匹配（不可靠：发行版 backport 不改版本号）
+	EvidenceBehavior                      // 有行为级验证（nuclei 命中/HTTP 200+特征/CVSS 触发）
+	EvidenceReplay                        // 有可复现回放（curl 命令+响应、截图、流量 ID）
 )
 
 // hasMechanicalVerification 检查 evidence 是否包含可机械复现的验证凭据。
 // 凭据定义（借鉴 raptor [GATES] 的 "tool output is the verdict"）：
-//   1. 包含 HTTP 状态码+响应特征（如 "200"、"403"、"HTTP/1.1 200 OK"）
-//   2. 包含 curl/httpx/nuclei/sqlmap 命令输出（工具名+关键输出行）
-//   3. 包含 base64/hex/hash/JSON 结构化数据
-//   4. 包含文件路径+文件大小/MD5（下载类证据）
+//  1. 包含 HTTP 状态码+响应特征（如 "200"、"403"、"HTTP/1.1 200 OK"）
+//  2. 包含 curl/httpx/nuclei/sqlmap 命令输出（工具名+关键输出行）
+//  3. 包含 base64/hex/hash/JSON 结构化数据
+//  4. 包含文件路径+文件大小/MD5（下载类证据）
+//
 // 这些是确定性信号——LLM 编造 evidence 时很难同时伪造所有形态。
 func hasMechanicalVerification(evidence string) bool {
 	lower := strings.ToLower(evidence)
 	signals := []string{
-		"http/1.", "http/2",                      // HTTP 原始响应头
-		"curl -", "curl ",                        // curl 命令
-		"sqlmap",                                 // sqlmap 输出
-		"nuclei",                                 // nuclei 模板命中
+		"http/1.", "http/2", // HTTP 原始响应头
+		"curl -", "curl ", // curl 命令
+		"sqlmap",                                                   // sqlmap 输出
+		"nuclei",                                                   // nuclei 模板命中
 		"status: 200", "status: 403", "status: 301", "status: 302", // 状态码
-		"\"code\":", "\"status\":",              // JSON 响应字段
+		"\"code\":", "\"status\":", // JSON 响应字段
 		"location:", "set-cookie:", "content-type:", // HTTP 响应头字段
 	}
 	for _, sig := range signals {

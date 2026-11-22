@@ -24,9 +24,9 @@
 | `github.com/chu0119/Pojun` | 主仓（PUBLIC，ghcr.io/chu0119/pojun 镜像随 tag 自动发布） |
 | `D:\xiangmu\ARTEX-SKILL` → `chu0119/pojun-skill` | 单技能可移植版（v2.0，与平台方法论同源，改动要双向同步） |
 | `github.com/chu0119/Norma` | agent harness SDK fork（go.mod replace 指向它；改 SDK 要单独发版并 bump replace 版本） |
-| **Kali 测试机** `192.168.198.128` | 真实运行实例（SSH 用户 xingchuan，paramiko 直连；凭据见本地记忆）。服务：`systemctl {pojun,pojun-hostd}`，目录 `/opt/pojun`，DB 是 PostgreSQL 库 **`artex`**（历史残留名），实例以 `pojun` 用户运行 |
+| **Kali 测试机** | 真实运行实例（内网地址与 SSH 用户见本地记忆，paramiko 直连）|服务：`systemctl {pojun,pojun-hostd}`，目录 `/opt/pojun`，DB 是 PostgreSQL 库 **`artex`**（历史残留名），实例以 `pojun` 用户运行 |
 | 本机 Docker | 测试 PG：容器 `pojun-audit-pg`（端口 15432，跑测试前 `docker start`） |
-| 公网机 120.55.171.237 | 半部署交接态（用户自管，v0.3.85+nginx），不要主动动 |
+| 公网机 | 半部署交接态（IP 见本地记忆；用户自管，v0.3.85+nginx），不要主动动 |
 
 **测试数据库**：本机 `POJUN_PG_DSN='postgres://pojun:pojuntest@127.0.0.1:15432/pojun_ci?sslmode=disable'`；跑测试前 `docker exec pojun-audit-pg psql -U pojun -d postgres -c "DROP DATABASE IF EXISTS pojun_ci; CREATE DATABASE pojun_ci;"`（共享库残留数据会造成假失败）。
 
@@ -76,7 +76,7 @@
 3. **Metasploit RPC 桥**（PentAGI 思路）：HexStrike 预设已给（v0.4.60），观察接入效果再决定是否原生桥。
 4. **SecLists 未装 Kali**（2.5G，GitHub 大文件下载被墙）——网络好时装。
 5. **Docker Hub 未发布**：需维护者配 DOCKERHUB_USERNAME/TOKEN secrets；README 只宣传 ghcr。
-6. **任务 18 paused**（渭南，19 条 open 意图）：用户示意后恢复；恢复时会走终态复活全流程（v0.4.57 修复）。
+6. **历史任务 paused**（19 条 open 意图）：用户示意后恢复；恢复时会走终态复活全流程（v0.4.57 修复）。
 7. **低产目标预期管理**：开局窄面提示已做（<10 资产）；可进一步做「预期产出 vs 实际」差距提示。
 8. **并行测试 flake 加固**：共享 PG 库的测试隔离（当前靠刷新库绕）。
 
