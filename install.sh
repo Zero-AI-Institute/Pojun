@@ -1393,6 +1393,7 @@ OWASP/Amass|amass_linux_{arch}.tar.gz|amass
 hahwul/dalfox|dalfox-{verv}-linux-{arch2}.tar.gz|dalfox
 epi052/feroxbuster|{arch2}-linux-feroxbuster.tar.gz|feroxbuster
 OJ/gobuster|gobuster_Linux_{lin}.tar.gz|gobuster
+chu0119/Pojun|killwxapkg_linux_{arch}|killwxapkg
 "
   local spec repo tmpl bin tag ver url asset file tmpd
   for spec in $specs; do
@@ -1427,12 +1428,13 @@ OJ/gobuster|gobuster_Linux_{lin}.tar.gz|gobuster
       rm -rf "$file" "$tmpd"
       continue
     fi
-    # 三种归档形态：.zip / .tar.gz / 单文件 .gz
+    # 三种归档形态：.zip / .tar.gz / 单文件 .gz；其余视为裸二进制
     local extracted=""
     case "$asset" in
       *.zip)  unzip -oq "$file" -d "$tmpd" 2>/dev/null || true ;;
       *.tar.gz|*.tgz) tar -xzf "$file" -C "$tmpd" 2>/dev/null || true ;;
       *.gz)   gzip -dc "$file" > "$tmpd/$bin" 2>/dev/null || true ;;
+      *)      cp "$file" "$tmpd/$bin" 2>/dev/null || true ;;
     esac
     if [ -f "$tmpd/$bin" ]; then
       extracted="$tmpd/$bin"

@@ -71,7 +71,7 @@ func (t *ToolSet) saveEvidence() actool.CoreTool {
 	return writeTool("save_evidence",
 		"把工作目录里的证据文件登记为任务附件（截图 / 数据样本 / 日志 / HTML / JSON），随报告导出成证据包。证据原样保真、明文保留（不打码/不脱敏，第一方递交官方核验）；大数据集可整份登记（附件上限 300 件/500MB）。同一文件重复登记会去重。",
 		obj(map[string]any{
-			"path":       str("工作目录内的相对路径（如 shots/login-userlist.png）"),
+			"path":       str("相对当前运行目录的路径（如 shots/login-userlist.png）；允许用 .. 回到任务根（如 ../miniapp/<appid>/source/app-service.js），但不得越出任务目录"),
 			"name":       str("可选：展示名（含扩展名）；省略用文件名"),
 			"kind":       str("可选：image|data|log|html|auto（默认按扩展名推断）"),
 			"source_url": str("可选：采集来源 URL"),

@@ -44,6 +44,7 @@ const skillRoutingGuidance = `
 - API 面（REST/GraphQL/鉴权链）→ Skill("api-security-testing") 或 Skill("api-recon")
 - 侦察面（子域/端口/指纹/目录）→ Skill("attack-surface-recon")
 - APK/移动端 → Skill("binary-mobile-reversing")
+- 微信小程序（上传 .wxapkg/.zip、提到小程序/AppID/小程序码/wxapkg）→ Skill("mini-program")
 - 写报告口径 → Skill("pentest-output-standards")
 - SRC 方法论库（知识库 48 篇按需加载）→ Skill("src-hunting")
 规则：意图里出现上述场景时，**第一步就加载对应技能**再动手；技能里的命令模板优先于你现编的命令。

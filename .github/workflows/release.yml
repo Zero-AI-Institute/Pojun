@@ -72,6 +72,17 @@ jobs:
           POJUN_PACKAGE_DIR: dist
         run: |
           ./build.sh --target "${POJUN_TARGET_OS}/${POJUN_TARGET_ARCH}"
+      # 小程序解包工具：官方只发 darwin/windows，Linux 版由本 workflow 交叉编译，
+      # 作为 Release 资产供 install.sh / hosttools 下载（MIT，随包附 LICENSE）。
+      - name: Build KillWxapkg (linux only)
+        if: matrix.goos == 'linux'
+        run: |
+          git clone --depth 1 --branch v2.4.1 https://github.com/Ackites/KillWxapkg /tmp/killwxapkg
+          cd /tmp/killwxapkg
+          CGO_ENABLED=0 GOOS=linux GOARCH=${{ matrix.goarch }} \
+            go build -trimpath -ldflags="-s -w" \
+            -o "${{ github.workspace }}/dist/killwxapkg_linux_${{ matrix.goarch }}" .
+          cp LICENSE "${{ github.workspace }}/dist/KillWxapkg-LICENSE"
       - name: Smoke test Linux amd64 binary
         if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
         run: dist/pojun-linux-amd64/pojun -h
@@ -85,6 +96,13 @@ jobs:
         with:
           name: pkg-${{ matrix.goos }}-${{ matrix.goarch }}
           path: "dist/*.zip"
+      - if: matrix.goos == 'linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: wxapkg-tool-linux-${{ matrix.goarch }}
+          path: |
+            dist/killwxapkg_linux_${{ matrix.goarch }}
+            dist/KillWxapkg-LICENSE
       # Linux 生二进制单独上传，供 docker job 复用（免在镜像里重编前端+Go）
       - if: matrix.goos == 'linux'
         uses: actions/upload-artifact@v4
@@ -106,9 +124,15 @@ jobs:
           pattern: pkg-*
           merge-multiple: true
           path: dist
+      # Linux 单二进制（pojun/hostd/killwxapkg）也在 Release 资产里，供 install.sh 直接下载。
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wxapkg-tool-linux-*
+          merge-multiple: true
+          path: dist
       - name: Generate checksums
         working-directory: dist
-        run: sha256sum *.zip > SHA256SUMS
+        run: sha256sum *.zip killwxapkg_linux_* KillWxapkg-LICENSE > SHA256SUMS
       # install.sh 也作为 Release 资产发布：README 推荐的
       # `curl -fsSL .../releases/latest/download/install.sh | sudo bash` 就取这里。
       - name: Stage install.sh
@@ -161,6 +185,8 @@ jobs:
             dist/*.zip
             dist/SHA256SUMS
             dist/install.sh
+            dist/killwxapkg_linux_*
+            dist/KillWxapkg-LICENSE
           body_path: /tmp/release-notes.md
 
   # ④ 多架构镜像（复用 binaries 编好的 Linux 二进制，镜像里只装工具 + 放二进制；

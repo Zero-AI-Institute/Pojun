@@ -96,6 +96,52 @@ var builtinTaskPlaybooks = []builtinTaskPlaybook{
 	},
 }
 
+// v0.4.99：第二批内置 Playbook。独立 flag，老库 task_playbooks_v1=done 不会
+// 让本批永久不可见（这是第一批 seed 设计的已知迁移坑）。
+var builtinTaskPlaybooksV2 = []builtinTaskPlaybook{
+	{
+		name:        "Playbook：微信小程序渗透（包→接口→越权→云开发）",
+		description: "适用：用户上传 wxapkg/zip 或给出小程序 AppID，要对其做安全测试。流程：安全解包→静态提取接口/密钥/云环境→登录态与越权→云开发/支付/开放能力→证据与报告。",
+		goal: `对「{{小程序名称/AppID}}」完成微信小程序渗透测试，产出可复现的漏洞报告。**核心思路：包是入口，后端才是主战场。**
+
+【内部工作流】
+1. 输入与资产：定位 uploads 下的 .wxapkg/.zip/目录，提取 AppID（wx+16 hex；不要用 wxid）；insert_assets(type=app, bundle_id=<AppID>, app_name=<名称>)。
+2. 解包：加载 Skill("mini-program")，执行 ${SKILL_DIR}/scripts/miniapp_unpack.sh --in <包> --out <taskRoot>/miniapp --appid <AppID>；产物 source/ 为质量分最高者，manifest.json 记录包哈希/工具/质量分。质量 partial 时标注并以动态验证补齐。
+3. 静态审计：调用 miniapp_audit(dir=<taskRoot>/miniapp/<AppID>/source, appid=<AppID>)；把 endpoints 批量 insert_assets(type=endpoint)，secrets 全文 record_fact（报告脱敏），云 env/函数/集合单独记录。
+4. 路由与高价值页面：读 app.json/app-config.json，列出主包/分包/插件页面；标记登录/支付/订单/地址/会员/上传页面。
+5. 动态验证（目标可达时）：
+   - 抓包：按 skill references/02 配 PC 微信 Proxifier/模拟器代理；或导入用户提供的请求样本。
+   - 登录态：session_login 建 A/B 双身份；对每个敏感接口跑未授权/水平/垂直越权矩阵（无 token、空 token、A→B、普通→管理、过期/伪造 token）。
+   - 云开发：按 references/04 测云函数鉴权、DB/存储规则、环境共享、未登录模式。
+   - 支付/开放能力：按 references/05 逐项；只做测试商户/沙箱/最小金额。
+6. 证据：每条候选漏洞 save_evidence（源码 file:line、请求响应、复现命令）；high/critical 过 evidence_check。
+7. 报告：report_finding（AppID + 页面路径 + 接口 + 请求响应 + 影响 + 修复）；输出资产清单、接口清单、漏洞清单（按风险排序）、修复优先级。
+8. 复测：修复后按 finding retest 流程复测。`,
+	},
+}
+
+// seedBuiltinTaskPlaybooksV2 插入第二批内置模板（独立批次 flag）。
+func (d *DB) seedBuiltinTaskPlaybooksV2() error {
+	const flag = "task_playbooks_v2"
+	if v, _, _ := d.GetSetting(flag); v == "done" {
+		return nil
+	}
+	for _, pb := range builtinTaskPlaybooksV2 {
+		in := TaskTemplateInput{
+			Name:        pb.name,
+			Description: pb.description,
+			Goal:        pb.goal,
+		}
+		if _, err := d.CreateTaskTemplate(in); err != nil {
+			if errors.Is(err, ErrTaskTemplateNameConflict) {
+				continue
+			}
+			return fmt.Errorf("playbook v2 %q: %w", pb.name, err)
+		}
+	}
+	return d.SetSetting(flag, "done")
+}
+
 // seedBuiltinTaskPlaybooks 种子内置任务模板（PentestAgent Playbook 思路落地）。
 // settings flag 记批次；插过即跳过——用户后续删除/修改不复活。
 func (d *DB) seedBuiltinTaskPlaybooks() error {

@@ -109,6 +109,35 @@ func (s *Server) taskArtifactsDir(taskID string) string {
 	return filepath.Join(s.m.dir, "tasks", taskID, "artifacts")
 }
 
+// resolveArtifactPath 解析证据文件路径：相对 runDir，允许用 .. 回到任务根
+// （例如 worker 在 tasks/<id>/i<N>/ 里登记 tasks/<id>/miniapp/<appid>/source/...），
+// 但最终必须仍落在 taskRoot 内。两边都做 symlink 解析后再比较，避免用链接绕出任务目录。
+func resolveArtifactPath(taskRoot, runDir, relPath string) (string, error) {
+	if strings.TrimSpace(relPath) == "" {
+		return "", fmt.Errorf("path 不能为空")
+	}
+	if strings.TrimSpace(runDir) == "" {
+		return "", fmt.Errorf("runDir 不能为空")
+	}
+	clean := filepath.Clean(relPath)
+	if filepath.IsAbs(clean) {
+		return "", fmt.Errorf("path 必须是相对路径（相对 runDir 或任务根）")
+	}
+	abs := filepath.Join(runDir, clean)
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		abs = resolved
+	}
+	root := taskRoot
+	if resolved, err := filepath.EvalSymlinks(root); err == nil {
+		root = resolved
+	}
+	rel, err := filepath.Rel(root, abs)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("path 超出任务目录范围")
+	}
+	return abs, nil
+}
+
 // RecordArtifact 把任务工作目录里的一个文件登记为证据附件：校验路径边界与
 // 限额 → 计算 sha256（同任务同内容去重）→ 复制到任务附件目录 → 落库。
 // relPath 相对 runDir（worker 的工作目录）；必须落在 tasks/<taskID>/ 之内。
@@ -118,26 +147,10 @@ func (s *Server) RecordArtifact(taskID, findingID int64, runDir, relPath, name, 
 		return nil, fmt.Errorf("PG 不可用")
 	}
 	taskKey := strconv.FormatInt(taskID, 10)
-	if strings.TrimSpace(relPath) == "" {
-		return nil, fmt.Errorf("path 不能为空")
-	}
-	clean := filepath.Clean(relPath)
-	if filepath.IsAbs(clean) || strings.HasPrefix(clean, "..") {
-		return nil, fmt.Errorf("path 必须是工作目录内的相对路径")
-	}
-	abs := filepath.Join(runDir, clean)
-	// 路径边界：必须落在 tasks/<taskID>/ 之下（防穿越到其他任务/data 其他区域）。
-	// 两边都做 symlink 解析后再比较，避免用链接绕出任务目录。
 	taskRoot := filepath.Join(s.m.dir, "tasks", taskKey)
-	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
-		abs = resolved
-	}
-	if resolved, err := filepath.EvalSymlinks(taskRoot); err == nil {
-		taskRoot = resolved
-	}
-	relToTask, err := filepath.Rel(taskRoot, abs)
-	if err != nil || strings.HasPrefix(relToTask, "..") {
-		return nil, fmt.Errorf("path 超出任务目录范围")
+	abs, err := resolveArtifactPath(taskRoot, runDir, relPath)
+	if err != nil {
+		return nil, err
 	}
 	info, err := os.Stat(abs)
 	if err != nil {

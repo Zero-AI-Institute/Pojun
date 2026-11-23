@@ -68,6 +68,22 @@
 - macOS 冒烟新增 plist `-addr` 与 `lsof` 仅回环断言，并改为 `pull_request`
   （路径命中 install.sh）触发。
 
+## [0.4.99] - 2026-11-23
+### 新增：微信小程序渗透能力（P0）
+
+- **技能 `mini-program`**：SKILL.md + 4 个脚本 + 13 篇 references（取包/抓包/登录态/云开发/开放能力/43 类漏洞/案例/清单/自动化/报告）。用户上传 `.wxapkg`/`.zip` 并说明是小程序，worker 路由即加载；默认绑定 `pentest`/`worker`。
+- **安全解包基线 `wxapkg_safe.py`**：V1MMWX 解密（PBKDF2-HMAC-SHA1 + AES-256-CBC + XOR）、索引变体兼容（indexLen 含/不含 fileCount、offset 绝对/相对、数据区重叠）、路径清洗（拒绝 `../`/绝对路径/UNC/NUL/超长名）、安全提取；不执行包内代码。
+- **质量解包阶梯 `miniapp_unpack.sh`**：wedecode（4.x/分包）→ unveilr（WXML 交叉验证）→ KillWxapkg（MIT 兜底，专用目录）；每个产物过 `quality_gate.py`（app.json/pages/WXML 非空与绑定率/占位符/新模板标记），选最优 `source` 并写 `manifest.json`。脚本兼容 macOS bash 3.2（不用 mapfile/关联数组，timeout 回退 gtimeout），AppID 严格校验防路径穿越。
+- **新工具 `miniapp_audit`**：复用 js_audit 内嵌 Python 的 `--dir` 分支，扫描接口/域名、硬编码密钥（AppSecret/AKSK/JWT/AES/地图 key）、云 env/函数/集合、签名候选、路由、sourceMap、OSV；输出 `report.json` / `endpoints.txt` / `secrets.txt`（脱敏）。worker/pentest 默认可绑定。
+- **Playbook v2**：新增「微信小程序渗透（包→接口→越权→云开发）」，独立批次 flag `task_playbooks_v2`，老库 `task_playbooks_v1=done` 不影响本批插入。
+- **KillWxapkg Linux 分发**：Release workflow 交叉编译 linux amd64/arm64 + LICENSE；Dockerfile 构建期内置；install.sh 表驱动下载（裸二进制）；hosttools 新增 `killwxapkg`（Release 下载失败时回退 Go 源码编译）。
+- **证据路径**：`save_evidence` 允许相对 runDir 用 `..` 回到任务根（仍校验最终落在 `tasks/<id>/` 内），便于登记 `miniapp/<appid>/source` 产物。
+
+### 测试
+
+- 新增 `TestMiniappAudit*`（命令组装/边界/真实 Python 扫描）、`TestMiniProgramEndToEnd`（合成加密包→解包→审计）、`TestResolveArtifactPath`（`..` 放行/越界拒绝）、Playbook v2 老库迁移测试。
+- 全量回归：`go test ./agent ./server ./hosttools ./db` 通过（db 使用测试 PG）。
+
 ## [0.4.98] - 2026-11-22
 ### 安全：issue #51/#52 校验一致性修复（FldBudin 报告）
 

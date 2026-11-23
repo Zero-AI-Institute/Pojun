@@ -229,8 +229,40 @@ curl -fsSL --retry 3 --connect-timeout 15 --max-time 600 https://api.github.com/
 TAG=$(cat /tmp/jadx.tag); VER=${TAG#v}
 curl -fsSL --retry 3 --connect-timeout 15 --max-time 600 -o /tmp/jadx.zip "https://github.com/skylot/jadx/releases/download/${TAG}/jadx-${VER}.zip"
 rm -rf /opt/jadx && mkdir -p /opt/jadx && unzip -q -o /tmp/jadx.zip -d /opt/jadx
-ln -sf /opt/jadx/bin/jadx /usr/local/bin/jadx
-ln -sf /opt/jadx/bin/jadx-gui /usr/local/bin/jadx-gui 2>/dev/null || true
+	ln -sf /opt/jadx/bin/jadx /usr/local/bin/jadx
+	ln -sf /opt/jadx/bin/jadx-gui /usr/local/bin/jadx-gui 2>/dev/null || true
+`},
+	{Name: "killwxapkg", Bin: "killwxapkg", Purpose: "微信小程序解包（自动解密/分包/还原工程）", Kind: KindScript, Category: CatMobile,
+		Script: `set -e
+case "$(uname -m)" in
+  x86_64|amd64) WXARCH=amd64 ;;
+  aarch64|arm64) WXARCH=arm64 ;;
+  *) echo "killwxapkg: unsupported arch $(uname -m)" >&2; exit 1 ;;
+esac
+TAG=$(curl -fsSL --retry 3 --connect-timeout 15 --max-time 120 https://api.github.com/repos/chu0119/Pojun/releases/latest 2>/dev/null | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d'"' -f4 || true)
+if [ -n "$TAG" ]; then
+  if curl -fsSL --retry 3 --connect-timeout 15 --max-time 300 -o /tmp/killwxapkg "https://github.com/chu0119/Pojun/releases/download/${TAG}/killwxapkg_linux_${WXARCH}"; then
+    install -m 0755 /tmp/killwxapkg /usr/local/bin/killwxapkg
+    rm -f /tmp/killwxapkg
+    exit 0
+  fi
+fi
+if command -v go >/dev/null 2>&1 && command -v git >/dev/null 2>&1; then
+  rm -rf /tmp/killwxapkg-src
+  git clone --depth 1 --branch v2.4.1 https://github.com/Ackites/KillWxapkg /tmp/killwxapkg-src
+  cd /tmp/killwxapkg-src
+  CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /usr/local/bin/killwxapkg .
+  exit 0
+fi
+echo "killwxapkg: 无 Release 资产且宿主无 Go 工具链" >&2
+exit 1
+`},
+	// wedecode 为 GPL-3.0 外部工具：只作为独立命令调用，不链接进主程序；
+	// 安装即从 npm 上游拉取，使用者需遵守其许可证。
+	{Name: "wedecode", Bin: "wedecode", Purpose: "小程序高质量解包（WXML/WXS/WASM/4.x；GPL-3.0 外部工具）", Kind: KindScript, Category: CatMobile,
+		Script: `set -e
+command -v npm >/dev/null 2>&1 || { echo "wedecode: 需要 Node/npm" >&2; exit 1; }
+npm install -g wedecode@0.10.6
 `},
 	{Name: "frida", Bin: "frida", Purpose: "动态 Hook（SSL pinning/加密/风控绕过）", Kind: KindPip, Category: CatMobile, Pip: "frida-tools"},
 	{Name: "objection", Purpose: "Frida 封装：一键绕过 pinning/root 检测", Kind: KindPip, Category: CatMobile, Pip: "objection"},

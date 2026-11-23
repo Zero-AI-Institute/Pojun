@@ -740,6 +740,9 @@ func (t *ToolSet) WorkerTools() []actool.CoreTool {
 		// js_audit（v0.4.59）：SPA/webpack 前端源码泄露审计——任务 18（Vue 站点）
 		// 实测对 .js.map 泄漏完全漏检；sourcemap 还原=原始源码+密钥+接口清单。
 		t.jsAudit(),
+		// miniapp_audit（v0.4.99）：微信小程序解包产物目录审计——接口/密钥/云环境/
+		// 签名候选/路由/sourceMap/OSV。与 js_audit 共用内嵌 Python 的 --dir 分支。
+		t.miniappAudit(),
 		// auth_request：用资产上已登记的凭据组装带认证的请求（横向/越权验证的前提）。
 		t.authRequest(),
 		// evidence_check（v0.4.71）：复核高/危漏洞证据是否足以支撑危害结论（13 项检查 + src_ready）。

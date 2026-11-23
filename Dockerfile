@@ -17,6 +17,10 @@ FROM golang:1.26-bookworm AS gobuild
 ENV CGO_ENABLED=0 GOBIN=/go/bin
 RUN go install github.com/ropnop/kerbrute@v1.0.3 \
     && go install github.com/tomnomnom/waybackurls@v0.1.0
+# 小程序解包兜底工具（MIT）：官方无 Linux 资产，构建期交叉编译。
+RUN git clone --depth 1 --branch v2.4.1 https://github.com/Ackites/KillWxapkg /tmp/killwxapkg \
+    && cd /tmp/killwxapkg \
+    && go build -trimpath -ldflags="-s -w" -o /go/bin/killwxapkg .
 
 FROM python:3.11-slim-bookworm
 ARG TARGETARCH
@@ -39,7 +43,7 @@ RUN if [ "$DEBIAN_MIRROR" != "deb.debian.org" ]; then \
 # Node 从 NodeSource 装 20.x：bookworm 自带的 apt nodejs 是 18，Playwright 要求 >=20。
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-         ca-certificates ripgrep curl wget vim git jq unzip \
+         ca-certificates ripgrep curl wget vim git jq unzip openssl \
          dnsutils iputils-ping netcat-openbsd inetutils-telnet whois nmap \
          imagemagick libreoffice-writer libreoffice-calc libreoffice-impress poppler-utils \
     && for pkg in masscan sqlmap hydra whatweb nikto ffuf john python3-impacket socat proxychains4; do \
@@ -52,6 +56,9 @@ RUN apt-get update \
 # kerbrute/waybackurls（上游无 arm64 资产，builder 现场编译）
 COPY --from=gobuild /go/bin/kerbrute /usr/local/bin/kerbrute
 COPY --from=gobuild /go/bin/waybackurls /usr/local/bin/waybackurls
+# 小程序解包兜底（KillWxapkg，MIT）：Linux 版由 builder 现场编译。
+COPY --from=gobuild /go/bin/killwxapkg /usr/local/bin/killwxapkg
+COPY --from=gobuild /tmp/killwxapkg/LICENSE /usr/share/licenses/KillWxapkg/LICENSE
 # nuclei(漏洞模板扫描引擎,配合 /app/nuclei-templates 情报模板库):
 # 官方 release 单二进制按架构下载,模板树由 pojun 的 vulnintel 同步器维护
 # (git clone --depth 1 到 /app/nuclei-templates,每轮同步 git pull 更新)。
@@ -103,7 +110,8 @@ COPY docker/install-tools.sh /tmp/install-tools.sh
 # 平台自带的 MCP 服务器（FOFA 资产测绘等）；相对路径由 start.sh 的 cwd(/app) 解析
 COPY mcp-servers/ /app/mcp-servers/
 # uv：MCP 预设「FOFA 资产测绘」用它拉起 Python stdio server
-RUN python3 -m pip install --no-cache-dir --quiet uv && uv --version
+# cryptography：小程序 wxapkg 的 V1MMWX 解密（wxapkg_safe.py 优先用它，缺省回退 openssl）
+RUN python3 -m pip install --no-cache-dir --quiet uv cryptography && uv --version
 RUN bash /tmp/install-tools.sh && rm -f /tmp/install-tools.sh
 # 注：catalog 全量 90 项的补齐**不在构建期做**（会把镜像再撑大 1–2GB、构建时间翻倍）。
 # 改为容器首次启动时后台预装（见 docker/docker-entrypoint.sh）：主服务不被阻塞，

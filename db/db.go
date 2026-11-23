@@ -284,6 +284,9 @@ ON CONFLICT (name) DO NOTHING`,
 	if err := d.seedBuiltinTaskPlaybooks(); err != nil {
 		return fmt.Errorf("seed task playbooks: %w", err)
 	}
+	if err := d.seedBuiltinTaskPlaybooksV2(); err != nil {
+		return fmt.Errorf("seed task playbooks v2: %w", err)
+	}
 	if err := d.seedDefaultInterceptRules(); err != nil {
 		return fmt.Errorf("seed intercept rules: %w", err)
 	}
@@ -388,6 +391,8 @@ var builtinSkillVisibility = map[string][]string{
 	// 浏览器自动化：worker 做 SPA/登录态探测时可用
 	"playwright-cli": {"pentest", "worker"},
 	"apk-reverse":    {"pentest", "worker"},
+	// 微信小程序：包在 uploads，先解包再静态/动态测试；执行面绑 worker/pentest。
+	"mini-program": {"pentest", "worker"},
 }
 
 // seedBuiltinSkillVisibility binds the shipped built-in skills to their default
