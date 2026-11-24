@@ -173,6 +173,24 @@ func Open(dsn string) (*DB, error) {
 	return d, nil
 }
 
+// OpenReadOnly opens an existing database without applying schema or seeding
+// builtins. Offline reporting/eval tools must not mutate the target deployment;
+// callers that need initialization keep using Open.
+func OpenReadOnly(dsn string) (*DB, error) {
+	sqlDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		return nil, err
+	}
+	sqlDB.SetMaxOpenConns(4)
+	sqlDB.SetMaxIdleConns(4)
+	sqlDB.SetConnMaxLifetime(30 * time.Minute)
+	if err := sqlDB.Ping(); err != nil {
+		sqlDB.Close()
+		return nil, fmt.Errorf("ping postgres (%s): %w", config.Redact(dsn), err)
+	}
+	return &DB{sqlDB}, nil
+}
+
 // builtinAgent describes one of the fixed agents and its prompt-variable catalog.
 type builtinAgent struct {
 	key, name, role, desc string

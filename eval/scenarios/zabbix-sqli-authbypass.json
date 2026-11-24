@@ -1,0 +1,28 @@
+{
+  "id": "zabbix-sqli-authbypass",
+  "name": "Zabbix 注入/认证绕过",
+  "source": "vulhub",
+  "target": "http://127.0.0.1:8080",
+  "setup": "cd vulhub/zabbix/CVE-2022-23131 && docker compose up -d",
+  "goal": "验证 Zabbix 认证绕过或注入并取得后台/数据证据",
+  "stages": [
+    "recon",
+    "authz",
+    "injection"
+  ],
+  "max_minutes": 45,
+  "expected": [
+    {
+      "vulnclass": "认证绕过",
+      "severity": "high",
+      "optional": false
+    },
+    {
+      "vulnclass": "注入",
+      "severity": "high",
+      "optional": true
+    }
+  ],
+  "notes": "认证绕过为必得项，注入为加分项；两项都拿到说明利用链更完整。",
+  "require_goal": false
+}

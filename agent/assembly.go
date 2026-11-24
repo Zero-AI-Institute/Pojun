@@ -62,8 +62,13 @@ func AugmentTools(ctx context.Context, agentKey string, base []actool.CoreTool) 
 		out = ToolResolve(ctx, agentKey, out)
 	}
 	out, def.FindingGuidance = findingWorkflowTools(agentKey, out)
+	// P2-2：schema 预算（默认 30 个可见，其余 deferred + BM25 search_tools）。
+	// 放在 findingWorkflowTools 之后，确保平台补进来的写回工具也参与评估。
+	out, def = applyToolVisibility(ctx, out, def)
 	for i, t := range out {
-		out[i] = guardPanic(t)
+		// 内层 panic 兜底，外层给外部回显加不可信边界（P2-5）。顺序不能反：
+		// panic 也要被包成普通 tool_result，再统一进入隔离层。
+		out[i] = &tracedTool{CoreTool: &untrustedTool{CoreTool: guardPanic(t)}}
 	}
 	return out, def, cleanup
 }

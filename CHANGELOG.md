@@ -2,6 +2,222 @@
 
 本项目的重要变更记录在此文件中，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [0.4.119] - 2026-11-25
+### 新增：确定性回归库（P2-7）
+
+- **数据层**：`finding_regressions`（finding_id 唯一）保存 vulnclass、baseline/proof
+  traffic_id、method/url、assertion（token/diff/status）、expected_status、token、
+  last_verdict/last_checked_at。**不落请求头/正文**（可能含 Cookie/凭据），检查时
+  从 traffic store 现取；流量清理后返回 `not_replayable`。
+- **自动沉淀**：finding 绑定了 proof/verification 流量且验证通过时，在 finding
+  事务内生成 spec（validator token 优先；http_diff/dual_identity 用 diff；否则
+  状态码弱断言）。回归层失败不影响 finding 落库。
+- **回放**：`GET/POST /api/findings/{id}/regression[/check]`；按原始请求重放，
+  token 存在=pass、diff 对照不消失=pass、状态码=弱 pass；POST/PUT/PATCH/DELETE
+  默认拒绝，必须显式 `allow_write=true`。回放仍受 Program Profile 的 allow/deny/
+  时间窗约束，不自动调度、不自动重试。
+- **前端**：漏洞详情新增「确定性回归检查」卡（spec 摘要、最近 verdict、运行按钮、
+  状态变更请求显式勾选）。
+
+### 调整：工具可见性默认关闭
+
+- `POJUN_TOOL_VISIBILITY_LIMIT` 默认值由 30 改为 **0（关闭）**，避免未经真实任务
+  A/B 的默认隐藏导致产出下降；需要的部署显式设置为 20–40 才启用。
+- v0.4.117 的 BM25/`search_tools`/deferred 机制保留，启用上限时仍生效。
+
+### 明确 non-goal
+
+- Bash/MCP 的非 HTTP 流量真硬边界需要网络命名空间/防火墙或独立代理组件，当前
+  v0.4.119 不提供假边界；原生 HTTP 的 allow/deny/时间窗/并发与 Program Profile
+  提示仍生效。P2-4 的 HTTP(S) shim 未在本版硬塞，避免破坏现有流量与出口回执语义。
+
+### 测试
+
+- DB：regression 往返/token 解析/无 proof 不生成/结果回读；
+- Server：原始请求解析、危险方法 allow_write；
+- 干净库：db 47.4s / agent 80.8s / server 52.5s / evidence 5.9s 全绿；
+- 前端 tsc + 静态导出通过。
+
+## [0.4.118] - 2026-11-24
+### 新增：OpenTelemetry 追踪（P2-3）
+
+- 新增 `telemetry/`：默认完全 no-op；设置 `OTEL_TRACES_EXPORTER=otlp` 或
+  `OTEL_EXPORTER_OTLP_ENDPOINT` 后启用 OTLP/HTTP 导出，`OTEL_SDK_DISABLED=true`
+  可显式关闭。
+- Span：`pojun.plan` / `pojun.worker` / `pojun.main_agent` 与每次工具调用
+  `execute_tool.<name>`；属性含 `task.id`、`intent.id`、`gen_ai.request.model`、
+  `tool.name`、`tool.is_error`、`tool.result_chars`。错误会 RecordError + Error 状态。
+- 接线：`server.New` 初始化全局 tracer provider；agent 的 tool 装饰器统一包 span。
+  默认无 exporter，不产生网络请求、不改变任何工具行为。
+- 依赖：`go.opentelemetry.io/otel` + sdk + otlptracehttp v1.35.0。
+
+### 测试
+
+- `TestTracedToolEmitsSpan`（内存 exporter 断言 span 名与 tool.name）；
+  `telemetry.Start` no-op 安全；干净库回归。
+
+## [0.4.117] - 2026-11-24
+### 新增：工具可见性上限 + BM25 工具搜索（P2-2）
+
+- **默认 30 个可见工具**：写回/核心执行面（Bash/文件、record_fact/report_finding/
+  insert_assets/save_evidence、http_request/session_login、goal/coverage 工具等）
+  永远可见；其余领域工具按当前任务/意图文本做 BM25 排序，保留 top N，剩余进入
+  SDK deferred 机制（schema 不进 prompt，只列名字）。
+- **BM25 搜索**：新增 `search_tools`（只读），对全部工具（含 deferred）按
+  name/description/prompt/schema 做 BM25，返回 name/description/schema/deferred；
+  延迟工具用 SDK 的 `ExecuteExtraTool` 调用。SDK 自带的 `SearchExtraTools` 仍保留。
+- **可关闭**：`POJUN_TOOL_VISIBILITY_LIMIT=0` 恢复全量可见；负数等价关闭。
+  默认 30，写回/核心工具即使超限也不会被藏。
+- 纯 schema 预算层：不改变工具注册、权限、执行行为；无匹配/无查询时按原顺序
+  补齐上限内工具，避免整类工具被藏光。
+
+### 测试
+
+- BM25 中英文/空查询；可见性上限/BM25 选中/essential 保留/关闭开关；
+  `search_tools` 返回 deferred 标记与 schema。
+- 干净库：agent 70.8s / server 46.3s 全绿；`go vet` 通过。
+
+## [0.4.116] - 2026-11-24
+### 新增：原生 HTTP 出口 allow/deny + 时间窗 + 并发上限（P2-4 第一批）
+
+- **Program Profile 新字段**：`allowed_hosts` / `denied_hosts`（精确或
+  `*.example.com`）、`window_start` / `window_end`（HH:MM，支持跨夜）、
+  `timezone`（IANA，空=服务器本地）、`max_concurrent`（0=不限）。
+- **原生 HTTP 硬边界**：`http_request` / `session_login` 在发请求前检查
+  host allow/deny 与时间窗；deny 优先于 allow；重定向目标也会重新检查，
+  防止 302 绕过初始 URL 的边界。并发上限用进程内信号量，超出等待而不是丢弃。
+- **仍然明确边界**：Bash/MCP 没有统一请求入口，不做半套硬边界，只在提示词
+  中要求按同样节奏/范围自律；UI 与提示都写明这一点。
+- **前端**：Program Profile 卡新增 allowlist/denylist、时间窗、时区、并发上限字段；
+  未配置时零行为变化。
+
+### 测试
+
+- DB：host 通配/URL 拒绝/控制字符、时间窗必须成对、非法时区、并发上限。
+- Agent：host 匹配、跨夜时间窗、allow/deny 优先级、denied host 不发请求、
+  redirect 不能绕过 denylist、并发信号量等待。
+- 干净库：db 47.0s / agent 77.2s / server 52.3s 全绿；前端 tsc + 静态构建通过。
+
+## [0.4.115] - 2026-11-24
+### 新增：高错误率工具标注（P2-1 第二批）
+
+- `db.HighErrorTools`：同维度内 ≥5 次调用且错误率 ≥60% 的工具，按错误率降序
+  取 Top3。
+- worker 的「本维度工具表现」块新增【历史高错误率（优先换参数/换入口/换工具）】
+  段；低错误率工具与高错误率工具分开展示，避免把两者混在一起。
+- 仍然只读、不拦截、不降权；样本不足（<2 个工具或合计 <8 次）时不注入。
+  错误率展示封顶 100%。
+
+### 测试
+
+- `TestRenderToolRoutingStats` 增加高错误率段断言；`TestToolRoutingBlock`
+  增加 nmap 10 次/7 错场景；干净库 agent 通过。
+
+## [0.4.114] - 2026-11-24
+### 新增：维度级工具路由学习（P2-1 第一批）
+
+- **统计**：`db.ToolOutcomeStats` 按「本任务维度 × 工具 × 结果」聚合
+  `activity`（tool_use / tool_result.is_error）与 `intent_reflections.dimension`；
+  只保留 ≥3 次调用的工具，按错误率升序、使用量降序取 Top 5。
+- **注入**：worker 启动时（`agent/tool_routing.go`）只在同维度至少 2 个工具、
+  合计 ≥8 次调用时，把「本维度工具表现（历史，仅参考）」追加到 system prompt；
+  写回/控制类工具排除；无足够样本时提示词逐字不变。
+- **只读、不拦截**：不改变工具选择、不降权、不阻止调用；只是把高错误率手段
+  提前告诉 worker，减少重复踩坑。错误率展示封顶 100%（一个 use 可能对应多条
+  error result）。
+
+### 测试
+
+- DB：`TestToolOutcomeStats`（维度过滤、最小样本、错误率排序、其他维度为空）。
+- Agent：`TestRenderToolRoutingStats`、`TestToolRoutingBlock`（注入/稀疏不注入）。
+- 干净库：db 44.4s / agent 67.9s 全绿；`go vet` 通过。
+
+## [0.4.113] - 2026-11-24
+### 安全：Program Profile 输入校验
+
+- `handle` 会作为 `X-Bug-Bounty` HTTP 头值发送，`platform/handle/scope/excluded/
+  scanners_allowed` 会进入系统提示。`Normalize` 现在拒绝 CR/LF/TAB/DEL 等控制
+  字符（防头注入/提示结构破坏），并拒绝 `NaN/Inf` RPS；长度/条数上限保持原值。
+- 新增校验测试（`a\r\nX-Evil: 1`、TAB、NUL 全部拒绝）；不影响合法 handle
+  （字母/数字/`.-_` 等仍可用）。
+
+## [0.4.112] - 2026-11-24
+### 新增：SRC/众测 Program Profile（P2-6 第一批）
+
+- **任务级 profile**：新增 `tasks.program_profile JSONB`（NULL=未配置，现有任务零行为变化）；
+  `GET/PUT /api/tasks/{id}/program-profile` 读写，写入做平台/长度/条数/RPS 校验并
+  异步清理 agent bundle，下一次 planner/worker/mainagent 装配生效，不中断运行中的 run。
+- **提示层**：`ProgramProfileBlock` 把平台/handle、公开 scope、excluded、允许的扫描器、
+  RPS、dry-run、allow_race 注入 planner/worker/mainagent system prompt；明确
+  “scope 不是授权范围替代品、excluded 永不可测、Bash/MCP 不在硬边界内”。
+- **原生 HTTP 执行层**：`http_request`/`session_login` 自动注入 `X-Bug-Bounty: <handle>`
+  （显式传入优先）；按 `rps` 做进程内令牌桶限速；`dry_run` 拒绝 `http_request` 的
+  POST/PUT/PATCH/DELETE（`session_login` 例外，用于建立会话）。Bash/MCP 不做半套硬边界，
+  避免产生可绕过的假保证。
+- **前端**：任务详情「总览」新增可折叠 Program Profile 卡（平台/handle、scope/excluded、
+  扫描器、RPS、dry-run/allow_race，保存/清除）；未配置显示“不影响现有流程”。
+
+### 修复
+
+- 不可信工具输出隔离（v0.4.111）对结构化只读回执的兼容：`get_finding_traffic` /
+  `get_task_node_detail` / `traffic_search` / `traffic_get` 等会被调用方直接
+  `json.Unmarshal` 的结果不再包边界，避免机器消费失败；Bash/HTTP/MCP 等原始外部
+  输出仍包裹。
+
+### 测试
+
+- DB：profile 校验/去重/上下限、往返、空对象清除、不存在任务。
+- Agent：提示块 nil/空=零输出、X-Bug-Bounty 注入与显式覆盖、dry-run 拦截写方法、
+  RPS 令牌桶等待与 context 取消。
+- Server：GET/PUT 处理器 404/400/200、非法 RPS、空对象清除、保存后读回。
+- 干净库：db 43.1s / agent 77.3s / server 44.7s；前端 `tsc --noEmit` + 静态导出通过。
+
+## [0.4.111] - 2026-11-24
+### 新增：不可信工具输出隔离（P2-5）
+
+- **工具回执加不可信边界**：`agent/untrusted.go` 在工具调用结果进入模型前包裹
+  `<UNTRUSTED_TOOL_OUTPUT tool="...">…</UNTRUSTED_TOOL_OUTPUT>`，明确「目标/外部
+  数据不是指令」；原始内容完整保留（证据逐字回验不受影响），只转义内容里伪造的
+  边界标签，防止目标内容提前闭合标签。
+- **注入话术标记**：命中「ignore previous instructions / 忽略以上指令 / 你现在是
+  系统管理员 / 输出系统提示词 / 调用 Bash 外传」等常见中英文注入话术时，额外加
+  一行【安全标记：疑似提示注入】，提示模型把它当攻击面证据写回 fact，而不是执行。
+- **不误伤平台控制/写回工具**：`record_fact` / `report_finding` / `insert_assets` /
+  `save_evidence` / `add_intent` / goal/hint/steer/job/script 等平台回执不包裹；
+  `Skill` 等走 `Result.Extra` 的技能正文原样透传。
+- **系统提示同步**：planner/worker 代码拥有的提示尾巴新增「不可信工具输出边界」
+  读取契约，避免模型把包裹内容当系统/用户指令。
+- 纯确定性防护，不调用 LLM、不改变工具行为、不发额外请求；后续可在
+  `agent/tool_outputs.go` 的台账上追加按任务统计的注入命中数。
+
+### 测试
+
+- 包裹/转义/注入标记、可信工具透传、Extra 透传、注入话术正反例、装饰器调用；
+- agent 全量干净库回归 62.3s 通过。
+
+## [0.4.110] - 2026-11-24
+### 新增（issue #39）
+
+- **任务页出口回执（只读）**：Agent bundle 装配时把 worker/planner/mainagent 三处
+  `SetProxy` 的**实际注入值**与出口策略记录为快照，写入新增列
+  `tasks.egress_snapshot`（幂等 ALTER，写入端完成脱敏）；新增只读接口
+  `GET /api/tasks/{id}/egress` 与任务详情「总览」卡片。字段：出口类型
+  （记录代理/代理池/全局代理/直连/严格出口阻断）、脱敏出口地址、capture
+  `enabled/injected/effective`（`effective` 以记录代理监听存活为准）与 CA 信号、
+  三角色实际出口（轮询池下可能不一致）、
+  捕获开启时的 MITM 上游**策略声明**（非实际出口 IP，且以 MITM 实际装载的上游为准）、
+  旁路执行面声明（custom_http_tool/auth_check/enrich/chat_agent 每次调用实时解析出口）、
+  默认 UA 声明表（平台固定/运行时默认/工具自带 + 覆盖入口）。不新增第 4 次 `ProxyAddr()`
+  调用、不改变选择逻辑与任何请求字节；代理用户名/密码/路径/查询串不落库，
+  解析失败只标 `parse_ok=false`；归档显式置空、恢复不回填；落库按 `captured_at`
+  单调写入，旧快照不会覆盖新回执。已知边界：真实出口 IP 依赖 #25 `exchanges.task_id`；
+  任务级 UA/出口配置属 #16 后续。
+- 新增单测：分类映射矩阵（含捕获开/关、池耗尽+严格、有/无全局代理、注入未监听）、
+  与真实 `Manager.ProxyAddr()` 的状态对拍、记录代理 `Running()` 生命周期、
+  `ProxyAddr()` 恰好三次的源码回归、脱敏泄漏断言、DB 往返与旧快照不覆盖新回执、
+  归档置空/恢复不回填、Handler 401/404/200(built=false/built=true) 与
+  schema 不兼容降级、`taskCols` 不含回执列、UA 常量一致性。
+
 ## [Unreleased]
 ### 新增（issue #41）
 
@@ -67,6 +283,174 @@
   `host_ip`。
 - macOS 冒烟新增 plist `-addr` 与 `lsof` 仅回环断言，并改为 `pull_request`
   （路径命中 install.sh）触发。
+
+## [0.4.109] - 2026-11-24
+### 修复：评测耗时对非终态任务误判
+
+- `bench score` 之前用 `now - first_run_at` 作为耗时；暂停/运行中的任务可能闲置
+  几十天（Kali 实测 task 18 暂停 18 天显示 27009 分钟），会被 `max_minutes`
+  误判为超时。新增 `duration_comparable`：只有 `done/failed/timeout` 才参与
+  `max_minutes` 判定；非终态任务在 `budget_notes` 写明原因，CLI 输出标注
+  “未终态，不参与超时判定”。
+- 新增 `TestScoreNonTerminalDurationNotComparable`（暂停 10 天 + max_minutes=1
+  仍不失败）。
+- 其余指标（token/USD/必得项/证据）仍按已落库数据正常评分，便于中途快照对比。
+
+## [0.4.108] - 2026-11-24
+### 新增：离线评测 harness（P1-4）
+
+- **`eval/` 包 + `pojun-maint bench`**：
+  - `bench score --scenario <json> --task <id>`：只读评分一次真实任务，输出 JSON；
+  - `bench validate --scenario <dir>`：校验场景库（ID 唯一、必得项/证据阈值合法）；
+  - `bench compare --a <json> --b <json>`：A/B 对比，输出指标 delta、新缺失/新命中，退步时退出码 1。
+- **评分维度**：pass（必得项 + 证据阈值 + 可选 require_goal/预算）、必得/可选命中、`unexpected` 额外发现（明确不直接等同误报）、证据完整度、阶段覆盖、token、按内置参考价的 USD、耗时、附件数。所有指标来自已落库数据，同一份数据重复评分结果稳定。
+- **内置场景随二进制分发**：`eval/scenarios/*.json` 通过 `go:embed` 编入
+  `pojun-maint`，`--scenario dvwa-sqli-xss` 可直接用；不需要在部署机上传 manifest，
+  也兼容磁盘上的 `.json` 文件/目录。`
+- **20 个种子场景**：DVWA/Juice Shop/WebGoat/bWAPP + Log4j2/Fastjson/Shiro/Struts2/ThinkPHP/Jenkins/WebLogic/Confluence/GitLab/ActiveMQ + Redis/MongoDB/Elasticsearch/Docker API/K8s API/Zabbix；manifest 含 `setup/target/goal/stages/expected/max_minutes/max_usd`，详见 `eval/README.md`。
+- **`pricing` 包**：把内置模型参考价从 `server/cost.go` 抽成单一来源，服务端成本视图与离线评测共用同一套估算，避免两边算出的 USD 对不上。
+- **`db.OpenReadOnly`**：评测 CLI 不执行 schema/种子（`db.Open` 会写库），确保 `bench score` 真正只读。
+
+### 调整
+
+- MCP 启动健康检查单服务器上限 30s → 45s：线上 browser MCP 冷启动实测 26s，30s 在慢网络下会误报；45s 与手动 refresh 上限一致。
+
+### 测试
+
+- `bench`：场景校验/重复 ID/评分匹配/证据完整度/额外发现/compare 退步判定；带库 `TestScoreTask` 通过（含缺 `llm_usage` 表的兼容路径）。
+- `pricing`：前缀匹配、free、未知模型不静默算免费。
+- 干净库回归：db 46.1s / server 51.4s / agent 70.6s 全绿；`go vet` 通过。
+
+## [0.4.107] - 2026-11-24
+### 新增：MCP 启动健康检查
+
+- **启动全量检查**：此前只在工具缓存为空时做一次发现，缓存过的 MCP 即使已经连不上也永远显示正常。现在启动时对所有 `enabled` MCP 串行执行「连接 + tools/list」，上限 30s/个；成功刷新工具缓存并记录延迟/工具数，失败保留旧缓存但记录脱敏错误。
+- **健康字段落库**：`mcp_servers` 新增 `last_check_at` / `last_ok` / `last_error` / `last_latency_ms` / `tool_count`（`ADD COLUMN IF NOT EXISTS`，旧库无需迁移）。`last_ok=NULL` 表示从未检查，避免把“没查过”误显示成“异常”。
+- **错误脱敏**：写入/展示前替换 env 里的密钥值、剥离 URL userinfo 与 query，压成单行并截到 500 字——MCP 错误不再把 API Key / token 带进日志和 UI。
+- **失败熔断联动**：启动检查失败会写入现有 10 分钟 MCP failure cooldown，避免每个 worker 启动都重新 fork 一个坏服务器；成功则清除 cooldown。
+- **手动 refresh 同步记账**：`POST /api/mcp/{id}/refresh` 和新增 MCP 的首次发现也走同一套健康记录；`GET /api/mcp` 直接返回健康字段。
+- **前端**：MCP 卡片新增「未检查 / 健康 · 延迟 / 异常」徽标；异常时显示脱敏错误摘要，工具数优先取最近一次健康检查的 `tool_count`。
+
+### 测试
+
+- `TestMCPHealthRoundTrip`（DB）：未检查=NULL → 失败置 false/错误/延迟 → 成功清错误并写 tool_count → 再失败保留旧 tool_count。
+- `TestRedactMCPError` / `TestRedactMCPErrorNilSafe` / `TestMCPHealthTimeoutBound`（server）。
+- 干净库回归：db 44.8s / server 50.6s / agent 70.3s 全绿；前端 `tsc --noEmit` + `NEXT_EXPORT=1 next build` 通过。
+
+## [0.4.106] - 2026-11-24
+### 修复：长意图摘要撑爆 Summary 预算
+
+- **open/running 意图纳入窗口化**：`blackboardSummaryData` 此前只裁剪 recent_done，
+  8 条 open + 8 条 running 的超长摘要（线上最长 2267 字）可让 Summary 达到 56KB，
+  12KB 预算失效，且降级到最后会把 hints 正文压空仍超预算。现在 open/running 与
+  recent_done 一样走 `sanitizeIntent`（摘要 ≤240 字、窗口 8 条）。
+- **降级顺序补全**：预算压力下先压 goals/task/open/running/recent_done/lessons/hints
+  的正文（新增 24 字档，避免直接清空），事实/漏洞窗口最后缩到 3 条；hints 与
+  失败方向条目始终保留。
+- **测试**：新增 `TestBlackboardSummaryBudgetWithLongIntents`——16 条超长意图摘要
+  场景断言 Summary ≤12KB 且 hints 正文非空。
+
+## [0.4.105] - 2026-11-24
+### 新增：上下文分层 + 价值评分 watchdog（P1-1 / P1-2）
+
+- **上下文分层渲染（P1-1）**：新增 `agent/blackboard.go` 的 `renderBlackboard` 三层契约——
+  - **Index（≤3KB，每轮必读）**：任务/目标缺口、前沿计数、覆盖缺口、最新事实/漏洞，以及
+    **永不折叠**的 hints、终态经验（`recent_lessons`）与失败/零产方向。
+  - **Summary（窗口化）**：最新 8 条事实/漏洞、open/running 意图窗口、失败方向优先的
+    终态意图窗口、覆盖矩阵前 5 缺口；超 12KB 时按固定顺序降级（先丢关联任务/冷区正文，
+    再缩窗口，最后才截短 hints/经验正文，条目一个不删）。
+  - **Raw（按需）**：`node_detail(id)` / `list_facts` / `list_findings` / `expand_digest(id)`
+    取完整证据；索引与摘要都显式标注"窗口不是全量"。
+- **planner/worker 注入改造**：planner 每轮注入 Index + Summary（不再整块全量 JSON）；
+  worker 启动消息只带 Index + 最新 8 条事实/漏洞，去掉与 Index 重复的 goals/hints 全量。
+- **`graph_overview` 支持分层**：新增 `view` 参数（`summary` 默认 / `index` / `full`）；
+  旧行为（完整快照）用 `view=full` 获取。工具 schema 启动时幂等补属性，无需迁移。
+- **价值评分 watchdog（P1-2）**：`idleStopper` 在"连续无写回"之外增加带衰减的价值分——
+  写回（fact/finding/evidence/assets）、深度验证（`audit_finding`、`verification_strategy`）、
+  高价值资产/入口命中、工具成功率共同计分；重复扫同一批 admin 路径不会靠关键词刷分。
+  - 基线宽限期 300s；价值分 ≥2 → 阈值 3→5 轮，≥5 → 延到 7 轮；工具失败率 ≥60% 且
+    score <1 → 阈值缩到 2 轮。
+  - 低分先 SOFT_WARN（原 nudge 提示写回），提示后仍无写回才终止；终止原因带上
+    `价值分/成功/失败/深挖/高价值命中`，终止前提示优先 `report_finding + save_evidence`。
+- **测试**：新增 `agent/blackboard_test.go`（3KB 索引预算、hints/失败方向不折叠、Summary
+  降级顺序、窗口上限）与 `agent/idlestop_value_test.go`（延长/缩短/高价值命中/重复扫描
+  不刷分/阈值与终止轮联动）；db/agent/server/report 干净库回归全绿。
+
+### 升级须知
+
+- `graph_overview` 默认返回从"完整快照"变为"窗口化摘要"；依赖完整字段的调用方显式传
+  `view=full`。planner 的 DB 可编辑提示无需改动——代码侧 `blackboardPlannerGuidance`
+  固定追加分层读取契约。
+
+## [0.4.104] - 2026-11-24
+### 修复
+
+- **工具目录重复注册**：`MainAgentTools` 中 `search_experience` 被重复加入 3 次、`diff_responses` 被重复加入 2 次，导致 `BuiltinToolSeeds` 的 agents 数组出现重复绑定、模型可能看到重复工具 schema。已去重，并在 `TestBuiltinToolSeeds` 增加「同一 seed 不得重复绑定同一 agent」守门。
+- **`search_experience` 维度归一**：`dimension` 参数支持中文/别名（越权→authz、注入→injection 等），与意图维度使用同一套归一表。
+
+### 文档
+
+- AI 渗透 Agent 调研总报告补充实施状态（v0.4.100–v0.4.103）。
+
+## [0.4.103] - 2026-11-24
+### 新增：技能速查预算 + 经验检索（P1 小步）
+
+- **技能速查预算**：`SkillIndexBlock` 设 6000 字符上限；预算用尽后仍保留技能名（路由信息），只省略描述，并提示可 `Skill(name=...)` 加载。防止技能数量增长挤占系统提示。
+- **`search_experience` 工具**（worker/planner/main，只读）：按关键词/维度检索本任务终态经验（成功、零产出、阻塞原因），按漏洞类别/技术栈检索跨任务成功 playbook；在重复方向或换打法前按需调用，避免把全部经验常驻上下文。
+- **测试**：新增审计跨任务隔离测试 `TestExplorationFindingScope`；db/agent/server/report 干净库全绿。
+
+## [0.4.102] - 2026-11-24
+### 新增：独立只读 Auditor + verification_strategy（P0-5）
+
+- **`verification_strategy`**：`report_finding` 新增可选枚举 `http_diff` / `dual_identity` / `effect_proof` / `poc_replay` / `oracle` / `manual`；省略时按证据自动推断（双流量→http_diff、A/B→dual_identity、可重放命令→poc_replay、影响字段→effect_proof、对照→oracle，否则 manual）。策略持久化到 finding 节点 payload，不改变 findings 表行结构。
+- **`audit_finding` 工具**（planner/main，只读、不调模型）：按策略做确定性复核——http_diff 要求 baseline+proof 两条流量；dual_identity 要求 A/B 双身份证据；effect_proof 要求 ≥120 字影响证据；poc_replay 要求可重放命令+输出；oracle 要求对照结果；manual 返回 needs_human。返回 pass/fail/needs_human + missing，跨任务 finding 直接拒绝。
+- **上报即复核**：`report_finding` 回执带 `verification_audit`；critical/high 复核失败会在 evidence_note 中列出缺失项（不阻断入库，但规划者/报告前可用 `audit_finding` 复跑）。
+- 修正 v0.4.101 的归一提示：只有入参确实被改写时才在回执中显示“已自动归一”，避免每条 finding 都带无关提示。
+
+### 测试
+
+- 新增 `TestAuditFindingPayloadStrategies` / `TestAuditFindingDualIdentity` / `TestAuditFindingEffectProof` / `TestDeriveVerificationStrategy`。
+- 回归：db/agent/server/report 干净库全绿。
+- 说明：MCP 启动健康检查/0-turn 重试仍留待 P1；本批 Auditor 为确定性检查，不是独立 LLM 角色。
+
+## [0.4.101] - 2026-11-24
+### 新增：任务级预算网关（P0-3）
+
+- **设置项**：`task_budget_tokens` / `task_budget_usd` / `task_budget_minutes` / `task_budget_warn_pct`（均为 0=不限；默认不限，不改变现有任务行为）。设置页新增「任务级预算（token / USD / 墙钟）」卡片。
+- **网关**：每轮规划前检查任务累计用量（`llm_usage` 全量，含 planner/worker/压缩/报告）；达到 `warn_pct`（默认 80%）注入一次收敛提醒（30 分钟节流）；达到 100% 直接 `settleTaskWithReason("budget")`，不再跑终局规划轮，终态在目标未达成时记 `timeout`（未完成）而非 done。
+- **USD**：按现有内置参考价逐模型估算；无定价模型按 0 计并在详情标注「USD 为下限」。
+- 修复设置保存的一个历史嵌套 bug：`playbook_inject_enabled` / `variant_intents_enabled` 此前只在同时提交 `intent_budget_minutes` 时才会保存，现独立生效。
+
+### 新增：写入工具参数容错与幂等键（P0-4）
+
+- **`normalizeToolInput`**：`report_finding` / `record_fact` 入参先归一——支持 JSON 字符串包裹、`{"finding":{...}}`/`{"fact":{...}}`/`{"data":{...}}` 外层、`vulnerability/type→vulnclass`、`desc/description→summary`、`proof/poc/request/response→evidence`、`risk/level→severity`（含中文 严重/高危/中危/低危）、`assets/asset_id→asset_ids`（标量/逗号串→数组）、`intent_id` 字符串→数字。
+- **兜底**：`vulnclass` 缺失时按摘要/证据关键词推导标准类别；仍为空才拒绝。`summary` 缺失时从 name/evidence 首行兜底；`severity` 缺失按 medium 处理并在回执注明。
+- **幂等键**：新增 `idem:<vulnclass>:<endpoint>:<param>` 强键（rank 3），同一类漏洞在同一参数位重复上报自动合并，证据仍保留。
+- 说明：MCP 启动健康检查/0-turn 重试不在本批，留待 P1。
+
+### 测试
+
+- 新增 `TestNormalizeToolInput*` / `TestDeriveVulnClass`、`TestFindingDedupKeysIdempotency`、`TestSettleTerminalStatusBudget` / `TestTaskBudgetConfigEnabled` / `TestTaskBudgetFromPGSettings`。
+- 回归：db/agent/server/report 在各自干净 PG 库全绿；前端 `tsc --noEmit` 与 `NEXT_EXPORT=1 next build` 通过。
+
+## [0.4.100] - 2026-11-24
+### 新增：覆盖率矩阵一等公民（P0-1）
+
+- **asset × dimension 矩阵**：新增 `agent.CoverageMatrix`（`agent/coverage_matrix.go`）与数据通路 `db.ScopeAssetsWithSources` / `CoverageIntentsForTask` / `CoverageFindingsForTask`，把「范围内资产、意图维度、写回产出、漏洞」join 成每格状态（untested/open/running/done/zero_yield/finding）与 Top 缺口（含样本资产）。
+- **四处同源**：planner 的 `graph_overview.coverage.matrix`、引擎 `coverage_nudge`、autopilot 续杯、Markdown/DOCX 报告的「覆盖与排除」章节都从同一矩阵取数；`coverage_nudge` 不再用 6 类关键词正则，改为按矩阵挑 1–2 个最高价值缺口（每格 6h 节流）。
+- **报告新增「覆盖与排除」**：范围资产/已触达/进行中/漏洞数 + 未测维度表（维度、资产类型、未测数量、样本）；明示“未测不等于有漏洞”。
+- **autopilot 续杯**：第 4 波「未覆盖面清零」直接用矩阵 Top 缺口点名资产类型/维度/样本，不再只发模板文案。
+
+### 新增：终态 reflection（P0-2）
+
+- **`intent_reflections` 表**：每个意图到达终态（done/exhausted/blocked）时，由引擎确定性写入一条 lesson（维度、终态、原因、写回数、工具调用/错误数、假设/验收标准、资产、摘要），不调用 LLM。
+- **planner 每轮可见**：`graph_overview.recent_lessons` 注入最近 8 条；worker 启动时按「同维度优先、同资产次之」注入最近 3 条（`agent/reflection_block.go`），避免重复同一种失败打法。
+- **无额外成本**：经验来自终态统计与意图自身 payload；写失败只记日志，不影响终态。
+
+### 测试
+
+- 新增 `TestBuildCoverageMatrix` / `TestBuildCoverageMatrixEmpty` / `TestIntentDimensionExport`（纯函数）、`TestCoverageMatrixData`（PG：scope/anchors/yields/findings 数据通路）、`TestIntentReflectionRoundTrip`（PG：upsert/维度过滤）、`TestBuildReflectionLesson`、`TestMarkdownCoverageSection`。
+- 回归：db/agent/server/report 在各自干净 PG 库全绿。
 
 ## [0.4.99] - 2026-11-23
 ### 新增：微信小程序渗透能力（P0）

@@ -44,7 +44,7 @@ const (
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: pojun-maint <scan-artifacts|previews|reset-prompts|fix-permissions|scope-audit|idscan> --config <config.json> [--force] [--out file]")
+		fmt.Fprintln(os.Stderr, "usage: pojun-maint <scan-artifacts|previews|reset-prompts|fix-permissions|scope-audit|idscan|bench> --config <config.json> [--force] [--out file]")
 		os.Exit(2)
 	}
 	cmd := os.Args[1]
@@ -52,6 +52,12 @@ func main() {
 	// flag set (whose ExitOnError would reject --db/--tiers/--task-map with exit 2).
 	if cmd == "idscan" {
 		runIDScan(os.Args[2:])
+		return
+	}
+	// bench 也是独立 flag 集：score/compare/validate 各有自己的参数，不能和
+	// scan-artifacts 的共享 flag 混在一起。
+	if cmd == "bench" {
+		runBench(os.Args[2:])
 		return
 	}
 	fs := flag.NewFlagSet(cmd, flag.ExitOnError)

@@ -2,7 +2,7 @@
 
 import * as React from "react";
 
-import { CpuIcon, DatabaseIcon, FlaskConicalIcon, GaugeIcon, KeyboardIcon, RadioTowerIcon, SearchIcon, ShieldAlertIcon, TimerResetIcon } from "lucide-react";
+import { CpuIcon, DatabaseIcon, FlaskConicalIcon, GaugeIcon, KeyboardIcon, RadioTowerIcon, SearchIcon, ShieldAlertIcon, TimerResetIcon, WalletIcon } from "lucide-react";
 import { toast } from "sonner";
 
 import { PageHeader } from "@/components/page-header";
@@ -58,6 +58,12 @@ export default function SystemSettingsPage() {
   const [intentBudgetMinutes, setIntentBudgetMinutes] = React.useState("0");
   const [intentBudgetMode, setIntentBudgetMode] = React.useState("soft");
   const [savingIntentBudget, setSavingIntentBudget] = React.useState(false);
+  // 任务级预算（v0.4.101）：0=不限；达到 warn_pct 提醒，100% 收尾。
+  const [taskBudgetTokens, setTaskBudgetTokens] = React.useState("0");
+  const [taskBudgetUSD, setTaskBudgetUSD] = React.useState("0");
+  const [taskBudgetMinutes, setTaskBudgetMinutes] = React.useState("0");
+  const [taskBudgetWarnPct, setTaskBudgetWarnPct] = React.useState("80");
+  const [savingTaskBudget, setSavingTaskBudget] = React.useState(false);
   const [savingAutoFinish, setSavingAutoFinish] = React.useState(false);
   // 冷节点压缩的输出预算与墙钟上限。0=用默认值(65536 token / 20 分钟)。
   const [compactionTokens, setCompactionTokens] = React.useState("0");
@@ -106,6 +112,10 @@ export default function SystemSettingsPage() {
     setIntentBudgetTokens(String(s.intent_budget_tokens ?? 3000000));
     setIntentBudgetMinutes(String(s.intent_budget_minutes ?? 0));
     setIntentBudgetMode(s.intent_budget_mode === "hard" ? "hard" : "soft");
+    setTaskBudgetTokens(String(s.task_budget_tokens ?? 0));
+    setTaskBudgetUSD(String(s.task_budget_usd ?? 0));
+    setTaskBudgetMinutes(String(s.task_budget_minutes ?? 0));
+    setTaskBudgetWarnPct(String(s.task_budget_warn_pct ?? 80));
   }, []);
 
   const saveWorkers = () => {
@@ -192,6 +202,43 @@ export default function SystemSettingsPage() {
       })
       .catch((e) => toast.error(`保存失败：${(e as Error).message}`))
       .finally(() => setSavingIntentBudget(false));
+  };
+
+  const saveTaskBudget = () => {
+    const tokens = Number(taskBudgetTokens);
+    if (!Number.isInteger(tokens) || (tokens !== 0 && (tokens < 100000 || tokens > 2000000000))) {
+      toast.error("任务 token 预算必须为 0（不限）或 100000–2000000000");
+      return;
+    }
+    const usd = Number(taskBudgetUSD);
+    if (!Number.isFinite(usd) || usd < 0 || usd > 1000000) {
+      toast.error("任务 USD 预算必须在 0–1000000（0=不限）");
+      return;
+    }
+    const mins = Number(taskBudgetMinutes);
+    if (!Number.isInteger(mins) || mins < 0 || mins > 10080) {
+      toast.error("任务墙钟预算必须在 0–10080 分钟（0=不限）");
+      return;
+    }
+    const warn = Number(taskBudgetWarnPct);
+    if (!Number.isInteger(warn) || warn < 50 || warn > 95) {
+      toast.error("预警阈值必须在 50–95（%）");
+      return;
+    }
+    setSavingTaskBudget(true);
+    api
+      .setSettings({
+        task_budget_tokens: tokens,
+        task_budget_usd: usd,
+        task_budget_minutes: mins,
+        task_budget_warn_pct: warn,
+      })
+      .then((s) => {
+        apply(s);
+        toast.success("已保存任务级预算（每一轮规划前检查）");
+      })
+      .catch((e) => toast.error(`保存失败：${(e as Error).message}`))
+      .finally(() => setSavingTaskBudget(false));
   };
 
   const saveCompaction = () => {
@@ -1076,6 +1123,78 @@ export default function SystemSettingsPage() {
             <div>
               <Button onClick={saveIntentBudget} disabled={!loaded || savingIntentBudget}>
                 {savingIntentBudget ? "保存中…" : "保存"}
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card className="order-25">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2 text-base">
+              <WalletIcon className="size-4" />
+              任务级预算（token / USD / 墙钟）
+            </CardTitle>
+            <CardDescription>
+              与意图级预算互补：本预算覆盖整个任务（planner 轮、压缩、报告等所有模型调用）。
+              达到预警阈值时注入一次收敛提醒；达到 100% 直接收尾（不再跑终局规划轮），
+              终态记「未完成」而非 done。三项均为 <b>0 = 不限</b>；修改后每一轮规划前检查。
+              USD 按内置参考价估算，部分模型无定价时按 0 计（仅作为下限）。
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="flex flex-col gap-4">
+            <div className="flex flex-wrap items-end gap-3">
+              <label className="flex flex-col gap-1 text-sm">
+                <span>任务 token 上限（0=不限）</span>
+                <Input
+                  type="number"
+                  min={0}
+                  step={100000}
+                  className="w-full font-mono text-sm sm:w-52"
+                  value={taskBudgetTokens}
+                  disabled={!loaded || savingTaskBudget}
+                  onChange={(e) => setTaskBudgetTokens(e.target.value)}
+                />
+              </label>
+              <label className="flex flex-col gap-1 text-sm">
+                <span>任务 USD 上限（0=不限）</span>
+                <Input
+                  type="number"
+                  min={0}
+                  step={0.01}
+                  className="w-full font-mono text-sm sm:w-40"
+                  value={taskBudgetUSD}
+                  disabled={!loaded || savingTaskBudget}
+                  onChange={(e) => setTaskBudgetUSD(e.target.value)}
+                />
+              </label>
+              <label className="flex flex-col gap-1 text-sm">
+                <span>任务墙钟上限（分钟，0=不限）</span>
+                <Input
+                  type="number"
+                  min={0}
+                  max={10080}
+                  className="w-full font-mono text-sm sm:w-48"
+                  value={taskBudgetMinutes}
+                  disabled={!loaded || savingTaskBudget}
+                  onChange={(e) => setTaskBudgetMinutes(e.target.value)}
+                />
+              </label>
+              <label className="flex flex-col gap-1 text-sm">
+                <span>预警阈值（%，50–95）</span>
+                <Input
+                  type="number"
+                  min={50}
+                  max={95}
+                  className="w-full font-mono text-sm sm:w-32"
+                  value={taskBudgetWarnPct}
+                  disabled={!loaded || savingTaskBudget}
+                  onChange={(e) => setTaskBudgetWarnPct(e.target.value)}
+                />
+              </label>
+            </div>
+            <div>
+              <Button onClick={saveTaskBudget} disabled={!loaded || savingTaskBudget}>
+                {savingTaskBudget ? "保存中…" : "保存"}
               </Button>
             </div>
           </CardContent>

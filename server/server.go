@@ -34,6 +34,7 @@ import (
 	"github.com/chu0119/pojun/llmpresets"
 	"github.com/chu0119/pojun/llmrec"
 	"github.com/chu0119/pojun/report"
+	"github.com/chu0119/pojun/telemetry"
 	"github.com/chu0119/pojun/traffic"
 	"github.com/chu0119/pojun/vault"
 )
@@ -172,6 +173,7 @@ type triggeredRun struct {
 }
 
 func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDir string) *Server {
+	telemetry.Init(ctx) // OTLP 仅在显式 OTEL_TRACES_EXPORTER=otlp/endpoint 时启用
 	key, err := loadOrCreateJWTKey(keyDir, dataDir)
 	if err != nil {
 		log.Fatalf("[auth] JWT key: %v", err)
@@ -290,9 +292,9 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		// 漏洞 IM 推送投递引擎。与 Scheduler 并列但独立：推送的实时性要求(3s)
 		// 与触发器的业务节奏不同，且两者失败互不牵连——推送卡住不该影响 agent 触发。
 		go newNotifier(s).Run(s.ctx)
-		// Fill the tool cache for any enabled MCP that has none yet (notably the
-		// seeded browser MCP on first run). Async so it never blocks startup.
-		go s.discoverEmptyMCPsOnStartup()
+		// Verify every enabled MCP at startup (connection + tools/list), recording
+		// last_ok/last_error/latency for the UI. Async so it never blocks startup.
+		go s.checkMCPHealthOnStartup()
 		logSink.SetDB(ctx, m.pg) // restore last 100 log rows and enable async persistence
 	}
 	// precedence: persisted DB config > env.
@@ -766,6 +768,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PATCH /api/task-templates/{id}", s.pgUpdateTaskTemplate)
 	mux.HandleFunc("DELETE /api/task-templates/{id}", s.pgDeleteTaskTemplate)
 	mux.HandleFunc("GET /api/tasks/{id}", s.getTask)
+	mux.HandleFunc("GET /api/tasks/{id}/egress", s.taskEgress)                     // issue #39：只读出口回执
+	mux.HandleFunc("GET /api/tasks/{id}/program-profile", s.getTaskProgramProfile) // v0.4.112
+	mux.HandleFunc("PUT /api/tasks/{id}/program-profile", s.putTaskProgramProfile) // v0.4.112
 	mux.HandleFunc("PATCH /api/tasks/{id}", s.updateTaskMetadata)
 	mux.HandleFunc("PATCH /api/tasks/{id}/category", s.updateTaskCategory)
 	// 任务级资产拦截/允许规则
@@ -938,6 +943,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/report", s.getReport)
 	mux.HandleFunc("GET /api/report/export", s.exportTaskDocx)
 	mux.HandleFunc("GET /api/findings/{id}/export", s.exportFindingDocx)
+	mux.HandleFunc("GET /api/findings/{id}/regression", s.findingRegression)
+	mux.HandleFunc("POST /api/findings/{id}/regression/check", s.checkFindingRegression)
 	mux.HandleFunc("GET /api/tools/inventory", s.toolsInventory)
 	// 宿主环境:体检(含一键安装可用性)+ 一键安装(经特权助手 pojun-hostd)
 	mux.HandleFunc("GET /api/hostenv/status", s.hostenvStatus)
@@ -3620,6 +3627,7 @@ func (s *Server) settingsPayload() map[string]any {
 	af := autoFinishConfigFromPG(s.m.pg)
 	apc := autopilotConfigFromPG(s.m.pg)
 	ib := intentBudgetFromPG(s.m.pg)
+	tb := taskBudgetFromPG(s.m.pg)
 	return map[string]any{
 		"traffic_capture":       s.m.TrafficEnabled(),
 		"agent_traffic_binding": s.m.pg.GetBool(settingAgentTrafficBinding, false),
@@ -3665,6 +3673,11 @@ func (s *Server) settingsPayload() map[string]any {
 		"playbook_inject_enabled": playbookInjectFromPG(s.m.pg), // v0.4.94 经验层
 		"variant_intents_enabled": variantIntentsFromPG(s.m.pg),
 		"intent_budget_mode":      map[bool]string{true: "hard", false: "soft"}[ib.HardMode],
+		// 任务级预算（v0.4.101）：0=不限；80% 预警、100% 收尾。
+		"task_budget_tokens":   tb.Tokens,
+		"task_budget_usd":      tb.USD,
+		"task_budget_minutes":  tb.Minutes,
+		"task_budget_warn_pct": tb.WarnPct,
 		// 证据逐字回验（v0.4.29）：off|warn|block，默认 warn。
 		"finding_evidence_verify":     evidenceVerifyModeFromPG(s.m.pg).String(),
 		"tool_output_injection_guard": injectionGuardFromPG(s.m.pg),
@@ -3767,6 +3780,11 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		PlaybookInject      *bool   `json:"playbook_inject_enabled"` // v0.4.94 经验层开关
 		VariantIntents      *bool   `json:"variant_intents_enabled"`
 		IntentBudgetMode    *string `json:"intent_budget_mode"` // soft|hard
+		// 任务级预算（v0.4.101）：0/null=不限；80% 预警、100% 收尾。
+		TaskBudgetTokens  *int64   `json:"task_budget_tokens"`
+		TaskBudgetUSD     *float64 `json:"task_budget_usd"`
+		TaskBudgetMinutes *int     `json:"task_budget_minutes"`
+		TaskBudgetWarnPct *int     `json:"task_budget_warn_pct"`
 		// 证据附件限额（#45/#50）：null=不改；<=0=恢复默认（300 件 / 500MB）。
 		ArtifactMaxCount *int   `json:"artifact_max_count"`
 		ArtifactMaxBytes *int64 `json:"artifact_max_bytes"`
@@ -3998,18 +4016,58 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 500, err.Error())
 			return
 		}
-
-		if req.PlaybookInject != nil {
-			if err := s.m.pg.SetSetting(settingPlaybookInject, strconv.FormatBool(*req.PlaybookInject)); err != nil {
-				writeErr(w, 500, err.Error())
-				return
-			}
+	}
+	if req.PlaybookInject != nil {
+		if err := s.m.pg.SetSetting(settingPlaybookInject, strconv.FormatBool(*req.PlaybookInject)); err != nil {
+			writeErr(w, 500, err.Error())
+			return
 		}
-		if req.VariantIntents != nil {
-			if err := s.m.pg.SetSetting(settingVariantIntents, strconv.FormatBool(*req.VariantIntents)); err != nil {
-				writeErr(w, 500, err.Error())
-				return
-			}
+	}
+	if req.VariantIntents != nil {
+		if err := s.m.pg.SetSetting(settingVariantIntents, strconv.FormatBool(*req.VariantIntents)); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	// 任务级预算（v0.4.101）：0=不限；token 最小 100k，USD 最小 0.01，分钟 1-10080。
+	if req.TaskBudgetTokens != nil {
+		if *req.TaskBudgetTokens != 0 && (*req.TaskBudgetTokens < 100_000 || *req.TaskBudgetTokens > 2_000_000_000) {
+			writeErr(w, 400, "task_budget_tokens 必须为 0（不限）或 100000–2000000000")
+			return
+		}
+		if err := s.m.pg.SetSetting(settingTaskBudgetTokens, strconv.FormatInt(*req.TaskBudgetTokens, 10)); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	if req.TaskBudgetUSD != nil {
+		if *req.TaskBudgetUSD < 0 || *req.TaskBudgetUSD > 1_000_000 {
+			writeErr(w, 400, "task_budget_usd 必须在 0–1000000（0=不限）")
+			return
+		}
+		if err := s.m.pg.SetSetting(settingTaskBudgetUSD, strconv.FormatFloat(*req.TaskBudgetUSD, 'f', 2, 64)); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	if req.TaskBudgetMinutes != nil {
+		if *req.TaskBudgetMinutes < 0 || *req.TaskBudgetMinutes > 10080 {
+			writeErr(w, 400, "task_budget_minutes 必须在 0–10080（0=不限）")
+			return
+		}
+		if err := s.m.pg.SetSetting(settingTaskBudgetMinutes, strconv.Itoa(*req.TaskBudgetMinutes)); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	if req.TaskBudgetWarnPct != nil {
+		if *req.TaskBudgetWarnPct < 50 || *req.TaskBudgetWarnPct > 95 {
+			writeErr(w, 400, "task_budget_warn_pct 必须在 50–95")
+			return
+		}
+		if err := s.m.pg.SetSetting(settingTaskBudgetWarnPct, strconv.Itoa(*req.TaskBudgetWarnPct)); err != nil {
+			writeErr(w, 500, err.Error())
+			return
 		}
 	}
 	if req.IntentBudgetMode != nil {
@@ -4538,6 +4596,7 @@ func (s *Server) getReport(w http.ResponseWriter, r *http.Request) {
 	md := report.Markdown(report.Input{
 		Title: t.Description, Goal: t.Goal, GeneratedAt: time.Now(),
 		AssetCounts: counts, Findings: findings, Goals: report.GoalLines(goals),
+		Coverage: s.reportCoverage(t),
 	})
 	w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
 	w.WriteHeader(200)

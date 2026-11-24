@@ -1,0 +1,28 @@
+{
+  "id": "juice-shop-core",
+  "name": "OWASP Juice Shop 核心漏洞",
+  "source": "juice-shop",
+  "target": "http://127.0.0.1:3000",
+  "setup": "docker run --rm -p 3000:3000 bkimminich/juice-shop",
+  "goal": "在 Juice Shop 中拿到至少一个注入/越权类漏洞并证明影响",
+  "stages": [
+    "recon",
+    "authz",
+    "injection"
+  ],
+  "max_minutes": 60,
+  "expected": [
+    {
+      "vulnclass": "注入"
+    },
+    {
+      "vulnclass": "未授权访问",
+      "optional": true
+    },
+    {
+      "vulnclass": "信息泄露",
+      "optional": true
+    }
+  ],
+  "require_goal": false
+}

@@ -75,12 +75,35 @@ func wireAgentAugment(pg *db.DB, skillDir string, hostTools func() ([]actool.Cor
 			return ""
 		}
 		desc := loadDesc()
+		const maxRunes = 6000 // v0.4.103：速查块预算（约 2-3k token），防止技能增长挤占上下文
 		var b strings.Builder
 		b.WriteString("【技能速查（你已绑定的 skill；命中场景必须先调 Skill 元工具加载全文再动手）】\n")
+		used := len([]rune(b.String()))
+		truncated := false
 		for _, n := range names {
-			if d, ok := desc[n]; ok && d != "" {
-				b.WriteString("- " + n + "：" + d + "\n")
+			d := desc[n]
+			line := "- " + n
+			if d != "" {
+				line += "：" + d
 			}
+			line += "\n"
+			if used+len([]rune(line)) > maxRunes {
+				// 预算用尽后仍保留技能名（名称是路由信息），描述省略。
+				short := "- " + n + "\n"
+				if used+len([]rune(short)) > maxRunes {
+					truncated = true
+					continue
+				}
+				b.WriteString(short)
+				used += len([]rune(short))
+				truncated = true
+				continue
+			}
+			b.WriteString(line)
+			used += len([]rune(line))
+		}
+		if truncated {
+			b.WriteString("（部分技能描述因预算省略；名称仍可 Skill(name=...) 加载）\n")
 		}
 		b.WriteString("调用方式：Skill(name=\"<名称>\")。技能内有验证口径/假点清单/报告模板，先加载可避免漏检与误报。")
 		return b.String()

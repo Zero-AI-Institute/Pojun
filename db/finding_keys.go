@@ -21,6 +21,7 @@ import (
 const (
 	FindingKeyRoot       = "root"
 	FindingKeyCVE        = "cve"
+	FindingKeyIdem       = "idem"
 	FindingKeyEndpoint   = "endpoint"
 	FindingKeyParam      = "param"
 	FindingKeyLegacy     = "legacy"
@@ -46,6 +47,10 @@ func strongFindingKeyRank(kind string) int {
 		return 1
 	case FindingKeyCVE:
 		return 2
+	case FindingKeyIdem:
+		// v0.4.101：vulnclass + endpoint + param 的幂等键。比 legacy 指纹更具体，
+		// 让同一类漏洞在同一参数位重复上报自动合并，而不是靠模型自觉。
+		return 3
 	case FindingKeyLegacy:
 		return 5
 	}
@@ -169,8 +174,13 @@ func FindingDedupKeys(in RecordFindingInput, fp string) []FindingKey {
 	endpoint := normalizeFindingEndpoint(firstFindingURL(in))
 	if endpoint != "" && !findingEndpointIsRoot(endpoint) {
 		add(FindingKeyEndpoint, "endpoint:"+endpoint)
-		if param := strings.ToLower(strings.TrimSpace(in.Parameter)); param != "" {
+		param := strings.ToLower(strings.TrimSpace(in.Parameter))
+		if param != "" {
 			add(FindingKeyParam, "param:"+endpoint+":"+param)
+		}
+		// v0.4.101 幂等键：同类别 + 同端点 + 同参数视为同一次发现的重报。
+		if vc := NormalizeVulnClass(in.VulnClass); vc != "" {
+			add(FindingKeyIdem, "idem:"+strings.ToLower(vc)+":"+endpoint+":"+param)
 		}
 	}
 	if fp != "" {

@@ -875,10 +875,19 @@ type MCPServer struct {
 	Enabled   bool            `json:"enabled"`
 	Insecure  bool            `json:"insecure"`        // http: skip TLS cert verification (self-signed servers, issue #108)
 	Tools     []string        `json:"tools,omitempty"` // cached tool names (mcp_tools_cache)
+	// 健康检查（v0.4.107）：启动或手动 refresh 时连接 + tools/list 的结果。
+	// LastOK=nil 表示从未检查；LastError 已脱敏、单行、≤500 字。
+	LastCheckAt   *time.Time `json:"last_check_at,omitempty"`
+	LastOK        *bool      `json:"last_ok,omitempty"`
+	LastError     string     `json:"last_error,omitempty"`
+	LastLatencyMS int        `json:"last_latency_ms,omitempty"`
+	ToolCount     int        `json:"tool_count"`
 }
 
 func (d *DB) ListMCP() ([]*MCPServer, error) {
-	rows, err := d.Query(`SELECT id,name,transport,COALESCE(command,''),args,env,COALESCE(url,''),enabled,insecure FROM mcp_servers ORDER BY id`)
+	rows, err := d.Query(`SELECT id,name,transport,COALESCE(command,''),args,env,COALESCE(url,''),enabled,insecure,
+last_check_at,last_ok,COALESCE(last_error,''),COALESCE(last_latency_ms,0),COALESCE(tool_count,0)
+FROM mcp_servers ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -886,11 +895,24 @@ func (d *DB) ListMCP() ([]*MCPServer, error) {
 	for rows.Next() {
 		var m MCPServer
 		var args, env []byte
-		if err := rows.Scan(&m.ID, &m.Name, &m.Transport, &m.Command, &args, &env, &m.URL, &m.Enabled, &m.Insecure); err != nil {
+		var checkedAt sql.NullTime
+		var lastOK sql.NullBool
+		var latency sql.NullInt64
+		if err := rows.Scan(&m.ID, &m.Name, &m.Transport, &m.Command, &args, &env, &m.URL, &m.Enabled, &m.Insecure,
+			&checkedAt, &lastOK, &m.LastError, &latency, &m.ToolCount); err != nil {
 			rows.Close()
 			return nil, err
 		}
 		m.Args, m.Env = json.RawMessage(args), json.RawMessage(env)
+		if checkedAt.Valid {
+			t := checkedAt.Time
+			m.LastCheckAt = &t
+		}
+		if lastOK.Valid {
+			ok := lastOK.Bool
+			m.LastOK = &ok
+		}
+		m.LastLatencyMS = int(latency.Int64)
 		out = append(out, &m)
 	}
 	if err := rows.Err(); err != nil {
@@ -964,6 +986,27 @@ ON CONFLICT (server_id, tool_name) DO UPDATE SET description=EXCLUDED.descriptio
 		}
 	}
 	return tx.Commit()
+}
+
+// SaveMCPHealth records the result of one startup/manual health check
+// (v0.4.107). errMsg must already be redacted by the caller. On failure the
+// previous tool_count is kept: a temporarily unreachable server should not look
+// like it lost all its tools until a successful discovery says so.
+func (d *DB) SaveMCPHealth(serverID int64, ok bool, latency time.Duration, errMsg string, toolCount int) error {
+	ms := latency.Milliseconds()
+	if ms < 0 {
+		ms = 0
+	}
+	if ok {
+		_, err := d.Exec(`UPDATE mcp_servers
+SET last_check_at=now(), last_ok=true, last_error=NULL, last_latency_ms=$2, tool_count=$3
+WHERE id=$1`, serverID, ms, toolCount)
+		return err
+	}
+	_, err := d.Exec(`UPDATE mcp_servers
+SET last_check_at=now(), last_ok=false, last_error=NULLIF($2,''), last_latency_ms=$3
+WHERE id=$1`, serverID, errMsg, ms)
+	return err
 }
 
 func (d *DB) SaveMCP(m *MCPServer) (int64, error) {

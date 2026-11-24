@@ -1,0 +1,24 @@
+{
+  "id": "webgoat-lessons",
+  "name": "WebGoat 课程靶场",
+  "source": "webgoat",
+  "target": "http://127.0.0.1:8080/WebGoat",
+  "setup": "docker run --rm -p 8080:8080 webgoat/webgoat",
+  "goal": "完成至少一个注入或越权课程并留下验证证据",
+  "stages": [
+    "recon",
+    "authz",
+    "injection"
+  ],
+  "max_minutes": 45,
+  "expected": [
+    {
+      "vulnclass": "注入"
+    },
+    {
+      "vulnclass": "未授权访问",
+      "optional": true
+    }
+  ],
+  "require_goal": false
+}

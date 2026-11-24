@@ -20,6 +20,13 @@ func TestBuiltinToolSeeds(t *testing.T) {
 		if s.Key == "" || s.Desc == "" {
 			t.Errorf("seed %q missing key/desc", s.Key)
 		}
+		seenAgents := map[string]bool{}
+		for _, a := range s.Agents {
+			if seenAgents[a] {
+				t.Errorf("seed %q has duplicate agent binding %q (tool listed twice?)", s.Key, a)
+			}
+			seenAgents[a] = true
+		}
 		byKey[s.Key] = s
 	}
 	// record_fact is bound to worker (also mainagent, which can log confirmed facts).

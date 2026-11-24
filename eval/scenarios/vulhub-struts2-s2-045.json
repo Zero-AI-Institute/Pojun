@@ -1,0 +1,25 @@
+{
+  "id": "vulhub-struts2-s2-045",
+  "name": "Struts2 S2-045 命令执行",
+  "source": "vulhub",
+  "target": "http://127.0.0.1:8080",
+  "setup": "cd vulhub/struts2/S2-045 && docker compose up -d",
+  "goal": "通过 Content-Type OGNL 注入取得命令执行证据",
+  "stages": [
+    "recon",
+    "injection",
+    "rce"
+  ],
+  "max_minutes": 40,
+  "expected": [
+    {
+      "vulnclass": "RCE",
+      "severity": "critical"
+    },
+    {
+      "vulnclass": "注入",
+      "optional": true
+    }
+  ],
+  "require_goal": false
+}

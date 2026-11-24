@@ -13,9 +13,39 @@ import (
 	"strings"
 	"time"
 
+	"github.com/chu0119/pojun/agent"
 	"github.com/chu0119/pojun/db"
 	"github.com/chu0119/pojun/report"
 )
+
+// reportCoverage builds the «覆盖与排除» section from the same matrix used by
+// the planner/nudge/autopilot (v0.4.100). Returns nil when the task has no
+// scoped assets or the matrix query fails — reports must never fail on advisory
+// coverage data.
+func (s *Server) reportCoverage(t *Task) *report.CoverageSection {
+	if t == nil || t.Store == nil {
+		return nil
+	}
+	tid, _ := strconv.ParseInt(t.ID, 10, 64)
+	m := agent.CoverageMatrixForTask(s.m.Assets(), t.Store, tid)
+	if m == nil || m.Assets == 0 {
+		return nil
+	}
+	rows := make([]report.CoverageRow, 0, len(m.TopGaps))
+	for _, g := range m.TopGaps {
+		rows = append(rows, report.CoverageRow{
+			Dimension: agent.DimensionLabel(g.Dimension),
+			AssetType: g.AssetType,
+			Untested:  g.Untested,
+			Samples:   strings.Join(g.Samples, "、"),
+		})
+	}
+	return &report.CoverageSection{
+		Assets: m.Assets, Tested: m.Tested, InProgress: m.InProgress,
+		Findings: m.Findings, Rows: rows,
+		Note: "覆盖按「资产 × 维度」计算；未测不等于有漏洞，零产出方向也计入排除范围。",
+	}
+}
 
 // exportExcludeStatuses 交付件默认剔除的分拣状态。
 // false_positive/duplicate/ignored/risk_accepted 都是「不该出现在客户面前」的
@@ -144,6 +174,7 @@ func (s *Server) exportTaskDocx(w http.ResponseWriter, r *http.Request) {
 		AppendixAssets: appendix,
 		PageHeader:     fmt.Sprintf("渗透测试报告 — %s", t.Description),
 		ArtifactImage:  s.artifactImageResolver(t.ID, 0),
+		Coverage:       s.reportCoverage(t),
 	})
 	name := fmt.Sprintf("pojun-report-task%s-%s.docx", t.ID, time.Now().Format("20060102"))
 	w.Header().Set("Content-Type", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")

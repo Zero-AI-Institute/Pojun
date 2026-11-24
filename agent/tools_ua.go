@@ -11,6 +11,13 @@ import (
 // 上限，也给 http_probe 最多 40 个 URL 的命令留出余量。
 const toolUserAgentMaxBytes = 1024
 
+// DefaultTargetUserAgent 是原生 HTTP 执行器（http_request / session_login）
+// 未显式传 user_agent 时使用的平台默认 UA。tools_http.go 仍保留同值字面量
+// （现有 js_audit UA 测试直接从源码回读该字面量做交叉断言）；本常量供出口
+// 回执等只读观测面引用，TestDefaultTargetUserAgentMatchesToolsHTTP 负责让两处
+// 不静默漂移。
+const DefaultTargetUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+
 // normalizeToolUserAgent 归一化并校验 curl 系工具的可选 user_agent。
 //
 // 两态语义：

@@ -237,6 +237,14 @@ func (s *Store) Record(ctx context.Context, in db.RecordFindingInput, refs []db.
 		}
 		if out != nil {
 			out.SkippedRefs = skipped
+			// P2-7：回归 spec 是派生数据，失败不能回滚已确认的 finding。
+			if _, err := tx.Exec(`SAVEPOINT finding_regression`); err == nil {
+				if err := db.UpsertFindingRegressionTx(tx, out.FindingID, in, prepared); err != nil {
+					_, _ = tx.Exec(`ROLLBACK TO SAVEPOINT finding_regression`)
+				} else {
+					_, _ = tx.Exec(`RELEASE SAVEPOINT finding_regression`)
+				}
+			}
 		}
 		return nil
 	})

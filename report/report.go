@@ -21,6 +21,28 @@ type Input struct {
 	Findings    []*db.Node
 	// Goals 是逐条任务目标及其达成状态（红队版 v0.6.31 下放）；nil = 报告省略「目标达成情况」。
 	Goals []GoalLine
+	// Coverage 是「覆盖与排除」小节（v0.4.100）；nil = 省略。
+	Coverage *CoverageSection
+}
+
+// CoverageRow is one untested asset-type × dimension gap.
+type CoverageRow struct {
+	Dimension string
+	AssetType string
+	Untested  int
+	Samples   string
+}
+
+// CoverageSection is the report-facing coverage/exclusion summary. It is built
+// from agent.CoverageMatrix by the server so the report package stays free of
+// agent/db-query imports.
+type CoverageSection struct {
+	Assets     int
+	Tested     int
+	InProgress int
+	Findings   int
+	Rows       []CoverageRow
+	Note       string
 }
 
 type findingView struct {
@@ -93,6 +115,23 @@ func Markdown(in Input) string {
 			b.WriteString("\n")
 		}
 		b.WriteString("\n")
+	}
+
+	// coverage / exclusion（v0.4.100）：报告不只讲发现了什么，也讲没测什么、
+	// 哪些方向试过但零产出。数据来自覆盖矩阵，与 planner 态势/引擎提醒同源。
+	if c := in.Coverage; c != nil {
+		fmt.Fprintf(&b, "## 覆盖与排除\n\n")
+		fmt.Fprintf(&b, "- 范围内资产：**%d** 个；已触达：**%d** 个；进行中：**%d** 个；确认漏洞：**%d** 个。\n\n", c.Assets, c.Tested, c.InProgress, c.Findings)
+		if len(c.Rows) > 0 {
+			b.WriteString("| 未测维度 | 资产类型 | 未测数量 | 样本 |\n|---|---|---:|---|\n")
+			for _, r := range c.Rows {
+				fmt.Fprintf(&b, "| %s | %s | %d | %s |\n", r.Dimension, r.AssetType, r.Untested, r.Samples)
+			}
+			b.WriteString("\n")
+		}
+		if c.Note != "" {
+			fmt.Fprintf(&b, "> %s\n\n", c.Note)
+		}
 	}
 
 	// findings

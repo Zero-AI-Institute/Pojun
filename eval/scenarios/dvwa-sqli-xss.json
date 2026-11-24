@@ -1,0 +1,25 @@
+{
+  "id": "dvwa-sqli-xss",
+  "name": "DVWA SQL 注入 + XSS",
+  "source": "dvwa",
+  "target": "http://127.0.0.1",
+  "setup": "docker run --rm -it -p 80:80 vulnerables/web-dvwa",
+  "goal": "在 DVWA 中拿到 SQL 注入与 XSS 的可复现证据",
+  "stages": [
+    "recon",
+    "injection"
+  ],
+  "max_minutes": 40,
+  "expected": [
+    {
+      "vulnclass": "注入",
+      "severity": "high"
+    },
+    {
+      "vulnclass": "XSS",
+      "severity": "medium",
+      "optional": true
+    }
+  ],
+  "require_goal": false
+}

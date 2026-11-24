@@ -42,6 +42,8 @@ type TaskDocxInput struct {
 	// ArtifactImage 证据附件图片解析器（v0.5.0）：Markdown 里
 	// ![说明](artifact:<id>) 会内嵌为图片；nil = 降级为文字说明。
 	ArtifactImage func(id int64) (data []byte, caption string, ok bool)
+	// Coverage 是「覆盖与排除」小节（v0.4.100）；nil = 省略。
+	Coverage *CoverageSection
 }
 
 func sevRankKey(f *db.DBFinding) int {
@@ -169,6 +171,21 @@ func BuildTaskDocx(in TaskDocxInput) *Docx {
 		d.P("测试执行窗口:" + in.TestWindow)
 	}
 	d.P("报告生成时间:" + FormatTimeUTC(in.GeneratedAt))
+	// 覆盖与排除（v0.4.100）：与 planner 态势/引擎提醒同源，明确“没测什么”。
+	if c := in.Coverage; c != nil {
+		d.H2("覆盖与排除")
+		d.P(fmt.Sprintf("范围内资产 %d 个，已触达 %d 个，进行中 %d 个，确认漏洞 %d 个。", c.Assets, c.Tested, c.InProgress, c.Findings))
+		if len(c.Rows) > 0 {
+			rows := make([][]string, 0, len(c.Rows))
+			for _, r := range c.Rows {
+				rows = append(rows, []string{r.Dimension, assetTypeCN(r.AssetType), fmt.Sprint(r.Untested), nz(r.Samples, "—")})
+			}
+			d.Table([]string{"未测维度", "资产类型", "未测数量", "样本资产"}, rows)
+		}
+		if c.Note != "" {
+			d.P(c.Note)
+		}
+	}
 	if len(in.AssetCounts) > 0 {
 		d.H2("测试范围")
 		d.P("本次测试覆盖以下资产类型（明细见附录 A）:")

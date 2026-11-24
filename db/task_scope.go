@@ -270,6 +270,8 @@ type CoverageAsset struct {
 	ID    int64  `json:"id"`
 	Type  string `json:"type"`
 	Label string `json:"label"`
+	// Tested 表示该资产已被事实锚点覆盖（覆盖矩阵用；旧查询不扫描此列）。
+	Tested bool `json:"tested,omitempty"`
 }
 
 // CoverageByType is per-asset-type coverage: total in scope vs tested.

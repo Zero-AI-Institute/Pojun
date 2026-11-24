@@ -1,0 +1,25 @@
+{
+  "id": "mongodb-unauthorized",
+  "name": "MongoDB 未授权访问",
+  "source": "infra",
+  "target": "mongodb://127.0.0.1:27017",
+  "setup": "docker run --rm -p 27017:27017 mongo:7",
+  "goal": "证明 MongoDB 未授权访问并读取数据库列表",
+  "stages": [
+    "recon",
+    "authz",
+    "data-export"
+  ],
+  "max_minutes": 25,
+  "expected": [
+    {
+      "vulnclass": "未授权访问",
+      "severity": "high"
+    },
+    {
+      "vulnclass": "信息泄露",
+      "optional": true
+    }
+  ],
+  "require_goal": false
+}

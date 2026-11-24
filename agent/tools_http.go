@@ -348,10 +348,14 @@ func (t *ToolSet) buildHTTPClient(jar http.CookieJar, follow, insecure bool, tim
 	if jar != nil {
 		c.Jar = jar
 	}
-	if !follow {
-		c.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+	c.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if !follow {
 			return http.ErrUseLastResponse
 		}
+		// 重定向目标也必须过 host allow/deny 与时间窗；否则一个 302 就能绕过
+		// 初始 URL 的硬边界。
+		return checkProgramEgress(req.URL.Hostname(), time.Now(), t.programAllowedHosts, t.programDeniedHosts,
+			t.programWindowStart, t.programWindowEnd, t.programLoc)
 	}
 	return c, nil
 }
@@ -421,6 +425,25 @@ func (t *ToolSet) doHTTP(ctx context.Context, a httpArgs, jar http.CookieJar) ht
 	if timeout > 120 {
 		timeout = 120
 	}
+	// P2-4 第一批：原生 HTTP 的 host allow/deny 与时间窗硬边界；空 profile 字段
+	// 表示不限制。Bash/MCP 没有统一入口，不做半套硬边界。
+	if err := checkProgramEgress(u.Hostname(), time.Now(), t.programAllowedHosts, t.programDeniedHosts,
+		t.programWindowStart, t.programWindowEnd, t.programLoc); err != nil {
+		out.Err = err
+		return out
+	}
+	release, err := acquireProgramSlot(ctx, t.taskID, t.programMaxConcurrent)
+	if err != nil {
+		out.Err = fmt.Errorf("program 并发等待被取消: %w", err)
+		return out
+	}
+	defer release()
+	// program profile 的 RPS 只作用于原生 HTTP 执行器（Bash/MCP 没有统一请求
+	// 入口，不做半套硬边界）；未配置 profile 时 waitProgramRPS 立即返回。
+	if err := waitProgramRPS(ctx, t.taskID); err != nil {
+		out.Err = fmt.Errorf("program RPS 等待被取消: %w", err)
+		return out
+	}
 	follow := true
 	if a.Follow != nil {
 		follow = *a.Follow
@@ -464,6 +487,10 @@ func (t *ToolSet) doHTTP(ctx context.Context, a httpArgs, jar http.CookieJar) ht
 			continue
 		}
 		req.Header.Set(kv[0], kv[1])
+	}
+	// program profile 的平台身份头：显式传入的 X-Bug-Bounty 优先，未传才补。
+	if t.programHandle != "" && req.Header.Get("X-Bug-Bounty") == "" {
+		req.Header.Set("X-Bug-Bounty", t.programHandle)
 	}
 	if a.BasicAuth != "" {
 		user, pass, _ := strings.Cut(a.BasicAuth, ":")
@@ -580,6 +607,9 @@ func (t *ToolSet) httpRequest() actool.CoreTool {
 			}
 			if strings.TrimSpace(a.URL) == "" {
 				return actool.Errorf("url 必填"), nil
+			}
+			if t.dryRun && !isSafeHTTPMethod(a.Method) {
+				return actool.Errorf(fmt.Sprintf("dry-run 模式禁止状态变更请求（%s）；只允许 GET/HEAD/OPTIONS。需要登录会话时用 session_login（不受此限）。", strings.ToUpper(strings.TrimSpace(a.Method)))), nil
 			}
 			var jar http.CookieJar
 			if strings.TrimSpace(a.Session) != "" {

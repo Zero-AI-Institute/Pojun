@@ -1,0 +1,23 @@
+{
+  "id": "bwapp-injection",
+  "name": "bWAPP 注入与文件读取",
+  "source": "bwapp",
+  "target": "http://127.0.0.1",
+  "setup": "docker run --rm -p 80:80 raesene/bwapp",
+  "goal": "在 bWAPP 中验证注入与任意文件读取",
+  "stages": [
+    "recon",
+    "injection"
+  ],
+  "max_minutes": 45,
+  "expected": [
+    {
+      "vulnclass": "注入"
+    },
+    {
+      "vulnclass": "任意文件读取",
+      "optional": true
+    }
+  ],
+  "require_goal": false
+}

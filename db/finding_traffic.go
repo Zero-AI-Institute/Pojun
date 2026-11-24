@@ -336,6 +336,10 @@ type RecordFindingInput struct {
 	TaskID, ExplorationID, IntentID                      int64
 	VulnClass, Name, Severity, Summary, Evidence, Worker string
 	AssetIDs                                             []int64
+	// VerificationStrategy（v0.4.102）：该漏洞的验证策略（http_diff/dual_identity/
+	// effect_proof/poc_replay/oracle/manual）。持久化到 finding 节点 payload，
+	// 供 audit_finding 做确定性复核；不改变 findings 表的行结构。
+	VerificationStrategy string
 	// v0.9 多键去重：同一根因的不同利用面/数据扩展应传同一个 RootCauseKey；
 	// MergeIntoFindingID 显式指定合并目标（优先级最高）；SurfaceNote 描述本次
 	// 利用面，写入更新记录。Endpoint/HTTPMethod/Parameter 可选，用于生成端点/参数键。
@@ -497,7 +501,11 @@ func RecordFindingTx(ctx context.Context, tx *sql.Tx, in RecordFindingInput, pre
 	// 未命中强键：仍按旧指纹兜底（历史行可能没有 finding_keys），并把弱键候选
 	// 一起返回给调用方做「可能重复」提示，不自动合并。
 	var mergeCandidates []int64
-	payload, _ := json.Marshal(map[string]any{"vulnclass": in.VulnClass, "name": in.Name, "severity": in.Severity, "summary": in.Summary, "evidence": map[string]any{"by": in.Worker, "poc": in.Evidence}})
+	payloadMap := map[string]any{"vulnclass": in.VulnClass, "name": in.Name, "severity": in.Severity, "summary": in.Summary, "evidence": map[string]any{"by": in.Worker, "poc": in.Evidence}}
+	if s := strings.TrimSpace(in.VerificationStrategy); s != "" {
+		payloadMap["verification_strategy"] = s
+	}
+	payload, _ := json.Marshal(payloadMap)
 	out := &RecordedFinding{}
 	if err := tx.QueryRow(`INSERT INTO exploration_nodes(exploration_id,kind,payload,priority,state,origin)
 VALUES($1,'finding',$2,9,'confirmed',$3) RETURNING id`, in.ExplorationID, string(payload), in.Worker).Scan(&out.NodeID); err != nil {

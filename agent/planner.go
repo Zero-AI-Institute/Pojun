@@ -14,6 +14,8 @@ import (
 	"github.com/Autumn-27/norma/transcript"
 	"github.com/chu0119/pojun/db"
 	"github.com/chu0119/pojun/intercept"
+	"github.com/chu0119/pojun/telemetry"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 // Planner is the event-driven LLM planner (docs §4.3): each time the asset or
@@ -45,6 +47,7 @@ type Planner struct {
 	nonStreamingFn       func() bool                            // resolver: use non-streaming (Complete) path? (nil = streaming)
 	noaEnabledFn         func() bool                            // resolver: use experimental noa compaction? (nil = off)
 	maxTokensFn          func() int                             // resolver: per-reply output cap (nil/0 = send no cap)
+	programProfile       *db.ProgramProfile                     // SRC/众测 profile（nil = 不渲染）
 	compactor            *Compactor                             // cold-node compaction (§7); nil = disabled
 
 	// todos keeps ONE plan-scratchpad per task (keyed by exploration id) so the
@@ -64,6 +67,9 @@ func (p *Planner) SetScopeFlags(scopeGuard, scopeInheritWrites, crossTaskNotifyD
 	p.scopeInheritWrites = scopeInheritWrites
 	p.crossTaskNotifyDedup = crossTaskNotifyDedup
 }
+
+// SetProgramProfile 注入任务级 SRC/众测 profile（v0.4.112）；nil=不渲染、零行为变化。
+func (p *Planner) SetProgramProfile(profile *db.ProgramProfile) { p.programProfile = profile }
 
 func (p *Planner) SetCompactionWindowResolver(fn func() int) { p.windowFn = fn }
 
@@ -326,17 +332,28 @@ func truncOutput(s string, n int) string {
 	return string(r[:n]) + " …（已截断，完整见 get_worker_output）"
 }
 
-// renderGraphOverview folds the pre-computed graph_overview snapshot into the
-// wake-up prompt so the planner starts each round with the full situation in
-// hand — saving the round-trip it would otherwise spend calling the tool. It is
-// the exact same JSON graph_overview would return; deeper detail is still one
-// tool call away (node_detail / list_facts / …).
+// renderGraphOverview folds the pre-computed situation snapshot into the wake-up
+// prompt in two layers (v0.4.105):
+//
+//	Index   ≤3KB — goals/gaps/frontier/hints/terminal lessons/failure directions.
+//	Summary — bounded windows of facts/findings/intents/coverage.
+//
+// Raw evidence stays out of the prompt by design: node_detail(id), list_facts,
+// list_findings and expand_digest are one call away. The split keeps a long task's
+// per-round situational prefix bounded instead of growing with the graph.
 func renderGraphOverview(data map[string]any) string {
-	b, err := json.Marshal(data)
-	if err != nil {
-		return "" // fall back to the model calling graph_overview itself
+	if len(data) == 0 {
+		return ""
 	}
-	return "\n\n【本轮态势（graph_overview 预取，等同你调用该工具的返回；需要细节再按需调 node_detail/list_facts 等）】：\n" + string(b)
+	idx := renderBlackboardIndex(data)
+	summary := trimSummaryToBudget(blackboardSummaryData(data))
+	b, err := json.Marshal(summary)
+	if err != nil {
+		return idx
+	}
+	return "\n\n【本轮态势索引（每轮必读；完整摘要见下方，原始证据用 node_detail/list_facts 取）】：\n" + idx +
+		"\n\n【态势摘要（窗口化；不是全量。更早事实用 list_facts 翻页，证据用 node_detail）】：\n" + string(b) +
+		"\n详情入口：graph_overview(view=summary|full) / list_facts / list_findings / node_detail(id) / expand_digest(id)"
 }
 
 // plannerDefaultTmpl is the built-in EDITABLE body (段 [A]) of the planner prompt,
@@ -355,7 +372,7 @@ const plannerDefaultTmpl = `你是一个网络安全平台授权渗透测试系�
 
 **每次唤醒的决策流程**：
 
-1. **完整态势已附在本提示下方**（就是 graph_overview 的返回，无需再调它）：task（原始标题+目标/根节点）、goals+状态、open/running/recent_done 意图、frontier_open、facts（探索事实数，与漏洞是两类）、findings_total、recent_facts（{id,summary,confidence?}）、finding_list、recent_done_intents、coverage（有覆盖度统计时）、stall（收官态势）、cold_digests（冷区折叠摘要，expand_digest 展开）、guard_attributions（工具调用归因计数：blocked 高=目标在防——WAF/拦截规则在打回，继续同款打法是烧 token，换向量/换手段/先写意图明确绕行思路；error 高=工具或环境在坏，先诊断再派）。
+1. **态势索引+窗口化摘要已附在本提示下方**（索引 ≤3KB 每轮必读；摘要只给最新窗口，不是全量）：task（原始标题+目标/根节点）、goals+状态、open/running/recent_done 意图、frontier_open、facts（探索事实数，与漏洞是两类）、findings_total、recent_facts（{id,summary,confidence?}）、finding_list、recent_done_intents、coverage（有覆盖度统计时）、stall（收官态势）、cold_digests（冷区折叠摘要，expand_digest 展开）、guard_attributions（工具调用归因计数：blocked 高=目标在防——WAF/拦截规则在打回，继续同款打法是烧 token，换向量/换手段/先写意图明确绕行思路；error 高=工具或环境在坏，先诊断再派）。**索引里的 hints / 终态经验 / 失败方向永远保留、不可省略**；更早的事实与证据不在摘要里，按需调 list_facts / list_findings / node_detail(id)，不要因为"摘要里没看到"就当作没发生过。
    - **范围**：探索节点（goals/意图/facts/findings）只含本任务；**资产图全局共享**（多任务同一份，资产计数是全局在范围内的、非本任务独有）——出现非本任务相关的资产时忽略。
    - **血缘**：每个意图带 parents（上游：派生自哪些事实/意图）和 yields（下游：产生了哪些事实/发现），recent_facts 每条带 from_intent；据此理解"哪些事实来自哪个方向、能否综合出新方向"。
    - **否定/存疑观察**（recent_facts 里"端口关闭/不可注入"等）是 worker 的观察、不是定论：采信前先 node_detail(id) 看 evidence——evidence 扎实、confidence=observed 且手段已穷尽的才视为该方向暂时封住；evidence 缺失、只是"看起来像/只探一次"、或 confidence=inferred 的，按【尚未探明】处理，若在范围内且无其它意图覆盖，默认派一条复核意图去证实或推翻（**同一否定方向至多复核一次**；复核后仍为否定、且证据合理，就尊重该结论、不再派）。
@@ -425,7 +442,7 @@ func plannerSystem(goal, dataDir, workDir string) string {
 	body := renderSystem("planner", plannerDefaultTmpl, PlannerVars{Goal: goal, DataDir: dataDir, Now: nowStr()})
 	// 作业硬尾巴（v0.4.63）：漏洞覆盖矩阵/纵深优先 + 授权边界复核。
 	return body + artifactSpec(workDir) + coverageMatrixPlannerGuidance + scopeVerifyPlannerGuidance + execFacePlannerGuidance +
-		engagementFraming + impactOrchestrationGuidance
+		engagementFraming + impactOrchestrationGuidance + blackboardPlannerGuidance + untrustedOutputGuidance
 }
 
 // Plan runs one planning round. emit, if non-nil, receives the planner's execution
@@ -437,6 +454,11 @@ func plannerSystem(goal, dataDir, workDir string) string {
 // for time/heartbeat wakes). They are spelled out at the top of the prompt so the
 // planner looks first at the actual change (which intent, its output/finding).
 func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts *db.ExplorationStore, goal string, triggers []TriggerEvent, emit func(db.Activity)) (met bool, reason string, err error) {
+	ctx, span := telemetry.Start(ctx, "pojun.plan",
+		attribute.Int64("task.id", taskID),
+		attribute.String("gen_ai.request.model", p.model),
+	)
+	defer span.End()
 	// cold-digest §2.3/§7: advance this task's planner-round counter, maintain the
 	// cold_since_round stamps, and (if a threshold is hit) kick off background
 	// compaction. Synchronous part is cheap (a few queries); the LLM compaction
@@ -453,6 +475,7 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 		tsx.SetAssetStore(as, as.Companies())
 	}
 	tsx.SetTaskID(taskID)
+	tsx.SetProgramProfile(p.programProfile)
 	tsx.SetCoverageEnabled(as == nil || as.CoverageEnabled(taskID))
 	tsx.killWork = p.killWork         // enable kill_work tool (nil = unavailable)
 	tsx.steerWork = p.steerWork       // enable steer_work tool (nil = unavailable)
@@ -464,6 +487,7 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	// 资产覆盖度功能关闭时剔除 add_task_scope/list_untested_assets（不入 prompt）。
 	base := append(tsx.DropCoverageTools(tsx.PlannerTools()), actool.DefaultTools()...)
 	ctx = WithRunInfo(ctx, RunInfo{TaskID: taskID, ExplorationID: explorationID(ts), Kind: KindPlanner})
+	ctx = WithToolQuery(ctx, goal)
 	tools, def, cleanup := AugmentTools(ctx, "planner", base)
 	defer cleanup()
 	// 关键态势（刚完成的意图 + 预取的完整图）改放【本轮 user 输入】(见下方 input)，system
@@ -499,6 +523,7 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	if p.wantConstraints() {
 		sysBody += constraintBlock(ts) // 操作约束(若有)注入系统提示,框定探索边界
 	}
+	sysBody += ProgramProfileBlock(p.programProfile)
 	// 自主推进：完成优先（目标未达成不得以「边际收益」收场）。
 	sysBody += autopilotTail(ctx, autopilotPlannerGuidance)
 	// 派发节奏（v0.4.68）：本轮新增上限 + 退役护栏说明。

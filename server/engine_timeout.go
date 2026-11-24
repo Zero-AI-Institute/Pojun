@@ -259,6 +259,10 @@ func settleTerminalStatus(metGoals, totalGoals int, reason string, finalRoundMet
 	if reason == "timeout" && !finalRoundMet {
 		return "timeout"
 	}
+	// 预算耗尽按「未完成」落 timeout，即使没有目标——避免把预算中止显示成 done。
+	if reason == "budget" && !finalRoundMet {
+		return "timeout"
+	}
 	return "done"
 }
 
@@ -285,6 +289,8 @@ func (e *Engine) settleTaskWithReason(ctx context.Context, t *Task, reason, deta
 		label = "planner 判定目标达成且无在跑意图"
 	case "auto_idle", "auto_coverage", "auto_rounds":
 		label = "自动收尾：" + detail
+	case "budget":
+		label = "任务预算耗尽：" + detail
 	}
 	log.Printf("[settle] task %s 进入收尾（%s）", t.ID, label)
 	if reason != "timeout" {
@@ -309,7 +315,8 @@ func (e *Engine) settleTaskWithReason(ctx context.Context, t *Task, reason, deta
 	// ⑤ 终局一轮 planner。goal_met 已经是 planner 的最终判定，不再多跑一轮；
 	// timeout 用超时收尾词，自动收尾用“按策略收尾”词。
 	met := reason == "goal_met"
-	if reason != "goal_met" {
+	// 预算收尾不再跑终局 planner：多跑一轮只会继续烧预算，且目标判定已无意义。
+	if reason != "goal_met" && reason != "budget" {
 		met = e.runFinalPlannerRound(ctx, t, reason)
 	}
 	if !e.beginTaskOperation(t.ID) {

@@ -515,6 +515,23 @@ func (t *Traffic) ProxyPoolConfigured() bool {
 	return pool.Configured()
 }
 
+// ProxyPoolStrategy 返回选择器当前生效的轮换策略；池未装载时返回空串。
+// 只读访问器，供出口回执等观测面使用，不影响 Pick/熔断行为。
+func (t *Traffic) ProxyPoolStrategy() string {
+	pool := t.pool.Load()
+	if pool == nil {
+		return ""
+	}
+	return pool.Strategy()
+}
+
+// Strategy 返回当前策略名（round_robin/sticky_host/sticky_host_random/random）。
+func (s *selector) Strategy() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.strategy
+}
+
 // Configured 报告选择器是否装载了至少一个启用条目。
 func (s *selector) Configured() bool {
 	s.mu.Lock()

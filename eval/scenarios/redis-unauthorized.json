@@ -1,0 +1,20 @@
+{
+  "id": "redis-unauthorized",
+  "name": "Redis 未授权访问",
+  "source": "infra",
+  "target": "redis://127.0.0.1:6379",
+  "setup": "docker run --rm -p 6379:6379 redis:7",
+  "goal": "证明 Redis 未授权访问并评估可进一步利用的影响",
+  "stages": [
+    "recon",
+    "authz"
+  ],
+  "max_minutes": 25,
+  "expected": [
+    {
+      "vulnclass": "未授权访问",
+      "severity": "high"
+    }
+  ],
+  "require_goal": false
+}

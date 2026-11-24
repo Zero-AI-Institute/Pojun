@@ -46,6 +46,8 @@ import type {
   FindingStats,
   FindingStatus,
   FindingsPage,
+  FindingRegressionCheck,
+  FindingRegressionResponse,
   FindingTraffic,
   FindingTrafficDetail,
   HostenvStatus,
@@ -100,8 +102,11 @@ import type {
   TaskAssetScopeMutation,
   TaskCategory,
   TaskConstraint,
+  TaskEgressResponse,
+  ProgramProfile,
   TaskGoal,
   TaskLLMResolutions,
+  TaskProgramProfileResponse,
   TaskNode,
   TaskScopeRow,
   TaskTemplate,
@@ -327,6 +332,8 @@ export const api = {
   tasks: () =>
     get<{ tasks: Task[]; active: string }>("/tasks").then((r) => ({ tasks: arr(r.tasks), active: r.active ?? "" })),
   task: (id: string) => get<Task>(`/tasks/${encodeURIComponent(id)}`),
+  // 任务出口回执（issue #39）：构建时只读快照，非实时值。
+  taskEgress: (id: string) => get<TaskEgressResponse>(`/tasks/${encodeURIComponent(id)}/egress`),
   createTask: (input: {
     name?: string;
     categoryId?: number;
@@ -443,6 +450,11 @@ export const api = {
       request_id: string;
     }>(`/tasks/${taskId}/intents/${intentId}/messages`, { message, request_id: requestId }),
   taskLLMResolution: (id: string) => get<TaskLLMResolutions>(`/tasks/${id}/llm/resolution`),
+  taskProgramProfile: (id: string) =>
+    get<TaskProgramProfileResponse>(`/tasks/${encodeURIComponent(id)}/program-profile`),
+  saveTaskProgramProfile: (id: string, profile: ProgramProfile) =>
+    put<TaskProgramProfileResponse>(`/tasks/${encodeURIComponent(id)}/program-profile`, profile),
+
   // 重跑一条没跑成功的意图(blocked/exhausted/stopped)：置回 open，worker 会重新认领、从头再跑。
   rerunIntent: (taskId: string, intentId: string) =>
     post<{ id: string; reopened: number }>(`/tasks/${taskId}/intents/${intentId}/rerun`),
@@ -678,6 +690,10 @@ export const api = {
     get<Finding>(
       `/exploration/findings/${id}${contextTaskId ? `?context_task=${encodeURIComponent(contextTaskId)}` : ""}`,
     ),
+  findingRegression: (id: string) =>
+    get<FindingRegressionResponse>(`/findings/${encodeURIComponent(id)}/regression`),
+  checkFindingRegression: (id: string, allowWrite = false) =>
+    post<FindingRegressionCheck>(`/findings/${encodeURIComponent(id)}/regression/check`, { allow_write: allowWrite }),
   findingTraffic: (id: string, contextTask?: string) =>
     get<FindingTraffic>(
       `/exploration/findings/${id}/traffic${contextTask ? `?context_task=${encodeURIComponent(contextTask)}` : ""}`,

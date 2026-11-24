@@ -20,6 +20,8 @@ import (
 	"github.com/chu0119/pojun/db"
 	"github.com/chu0119/pojun/hosttools"
 	"github.com/chu0119/pojun/intercept"
+	"github.com/chu0119/pojun/telemetry"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 // Worker is an LLM work agent (docs §4.4): it claims ONE intent, completes it
@@ -96,6 +98,8 @@ type Worker struct {
 	// maxTokensFn resolves the per-reply output cap in tokens, on the same
 	// per-run basis. nil or 0 = send no cap and let the endpoint decide.
 	maxTokensFn func() int
+	// programProfile 是任务级 SRC/众测 profile（v0.4.112）；nil=不渲染，零行为变化。
+	programProfile *db.ProgramProfile
 }
 
 // WorkerSessionID returns the stable transcript key used by a worker intent.
@@ -397,7 +401,7 @@ func workerSystem(proxyAddr, caCert, dataDir, runDir string) string {
 	// Optional finding guidance is added for every role after tool resolution.
 	// 作业硬尾巴（v0.4.63）：扫描器优先 + 技能路由，代码注入不可经 UI 改掉。
 	out := body + workerTrafficBlock(caCert != "") + workerEgressBlock(proxyAddr) + workerArtifactSpec(runDir) + scannerFirstGuidance + skillRoutingGuidance + execFaceWorkerGuidance +
-		engagementFraming + impactVerificationGuidance
+		engagementFraming + impactVerificationGuidance + untrustedOutputGuidance
 	// 宿主工具清单：真正动手的是 worker，所以清单必须进 worker 的 system prompt。
 	// 之前只有 planner 的唤醒提示里有（用于「派意图选手段」），worker 看不到——
 	// 于是新装的一批工具（dalfox/feroxbuster/chisel…）一次都没被用起来。
@@ -504,14 +508,39 @@ func renderWorkerGraphOverview(data map[string]any) string {
 	// data 来自 workerOverviewData（瘦身版），本就不含 coverage/规划专用字段；
 	// delete 兜底：若有调用方误传 planner 全量快照，也不把覆盖度灌给 worker。
 	delete(data, "coverage")
-	b, err := json.Marshal(data)
+	// v0.4.105 上下文分层：worker 启动消息也只带 Index + 小窗口（最新 8 条事实/
+	// 漏洞），完整历史按 id 用 node_detail/list_facts 取。worker 的职责是单条
+	// 意图，不需要为全图历史付每轮固定前缀。
+	idx := renderBlackboardIndex(data)
+	lean := map[string]any{}
+	if task := mapValue(data["task"]); task != nil {
+		lean["task"] = map[string]any{
+			"description": clipText(textValue(task["description"]), 800),
+			"goal":        clipText(textValue(task["goal"]), 800),
+		}
+	}
+	// goals/hints 已完整进入 Index（hints 永不折叠），这里不再重复同一份 JSON。
+	if v, ok := data["finding_list"]; ok {
+		lean["finding_list"] = capSliceMaps(v, 8)
+	}
+	if v, ok := data["recent_facts"]; ok {
+		lean["recent_facts"] = capSliceMaps(v, 8)
+	}
+	for _, k := range []string{"facts", "findings_total", "host_count"} {
+		if v, ok := data[k]; ok {
+			lean[k] = v
+		}
+	}
+	lean["note"] = "窗口化态势；需要更早事实/完整证据用 list_findings / node_detail(id) / get_worker_trace。"
+	b, err := json.Marshal(lean)
 	if err != nil {
-		return "" // fall back silently: the worker just won't have the global context
+		return idx // fall back to the index alone
 	}
 	return "\n\n【全局探索态势（只读，帮你把自己这条意图放进大局看）】：\n" +
 		"下面是整个任务当前的探索概况。用途有两个：一是知道别人已发现什么，别重复；二是让你探自己这条意图时，能联想到它和全局的关系。\n" +
 		"**发散是好事**：探本意图时尽管深想、多联想。唯一的界线是——别真的动手去执行别的意图（那是别的 worker 的事，由规划者调度）。但凡你联想到有价值的线索（跨资产的联动、疑似另一条利用链的入口、全局层面的可疑点），**务必写进 fact 交规划者**——这是你重要的产出，不是可有可无。宁可多报一条让规划者判断，也别自己咽下去。\n" +
-		string(b)
+		idx + "\n" + string(b) +
+		"\n详情入口：node_detail(id) / list_findings / get_worker_trace；更早的全局事实可请规划者翻页。"
 }
 
 // Execute runs one intent. hooks (the per-task Guard) gates every tool call; may
@@ -548,11 +577,18 @@ func firstCancel(cs []func(error)) func(error) {
 }
 
 func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.AssetStore, ts *db.ExplorationStore, intent *db.Node, hooks harness.HookRunner, emit func(db.Activity), enr EnrichTrigger, notifyFinding func(int64, string), requestID, message string, workCancel func(error)) (harness.TerminalReason, WriteCounts, error) {
+	ctx, span := telemetry.Start(ctx, "pojun.worker",
+		attribute.Int64("task.id", taskID),
+		attribute.Int64("intent.id", intent.ID),
+		attribute.String("gen_ai.request.model", w.model),
+	)
+	defer span.End()
 	tsx := NewToolSet(ts, name)
 	tsx.SetEgressProxy(w.proxyAddr, w.proxyCACert) // 原生 http_request/session_login 与 Bash 同源出口
 	tsx.SetScopeFlags(w.scopeGuard, w.scopeInheritWrites, w.crossTaskNotifyDedup)
 	tsx.SetFindingRecorder(w.findingRecorder)
 	tsx.SetTaskID(taskID)
+	tsx.SetProgramProfile(w.programProfile)
 	coverageEnabled := as == nil || as.CoverageEnabled(taskID)
 	tsx.SetCoverageEnabled(coverageEnabled)
 	if as != nil {
@@ -569,6 +605,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// 收敛工具面、减少低价值调用。其余 SDK 默认工具(Read/Write/Edit/LS/Bash/Sleep)照常。
 	base = append(base, defaultToolsExcept("MultiEdit", "Glob", "Grep")...)
 	ctx = WithRunInfo(ctx, RunInfo{TaskID: taskID, ExplorationID: explorationID(ts), IntentID: intent.ID, Kind: KindWorker})
+	ctx = WithToolQuery(ctx, intentToolQuery(intent))
 	tools, def, cleanup := AugmentTools(ctx, "worker", base)
 	defer cleanup()
 
@@ -593,6 +630,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	if w.wantConstraints() {
 		sysBody += constraintBlock(ts) // 操作约束(若有)注入系统提示,worker 执行时严格遵守
 	}
+	sysBody += ProgramProfileBlock(w.programProfile)
 	if w.taskAuthBlock != "" {
 		sysBody += w.taskAuthBlock // 任务级登录凭据（v0.4.8）：先登录再测
 	}
@@ -625,6 +663,11 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	if b := priorFactsBlock(ts, ids, 8); b != "" {
 		sysBody += b
 	}
+	// 终态经验（v0.4.100）：同维度/同资产上已经失败或零产出的方向，引擎在终态
+	// 自动沉淀；worker 开局先看，避免重复同一种打法。
+	sysBody += recentLessonsBlock(ts, intent, 3)
+	// P2-1 工具路由：同维度历史工具错误率，提示 worker 别重复高错误率打法。
+	sysBody += toolRoutingBlock(ts, intent, 5)
 	// 自主推进：本意图必须被证实/证伪，不得空转收场。
 	sysBody += autopilotTail(ctx, autopilotWorkerGuidance)
 	sysBody += "\n\n开始执行上面这条意图：只做它、只产生事实、assets、finding、做完即停。"
@@ -835,3 +878,6 @@ func (w *Worker) SetScopeFlags(scopeGuard, scopeInheritWrites, crossTaskNotifyDe
 	w.scopeInheritWrites = scopeInheritWrites
 	w.crossTaskNotifyDedup = crossTaskNotifyDedup
 }
+
+// SetProgramProfile 注入任务级 SRC/众测 profile（v0.4.112）；nil=不渲染。
+func (w *Worker) SetProgramProfile(profile *db.ProgramProfile) { w.programProfile = profile }

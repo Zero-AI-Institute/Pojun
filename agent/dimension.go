@@ -90,6 +90,72 @@ func intentDimension(explicit, summary string) string {
 	return inferDimension(summary)
 }
 
+// IntentDimension is the exported form used by server-side reflection/coverage
+// code that already imports agent.
+func IntentDimension(explicit, summary string) string { return intentDimension(explicit, summary) }
+
+// dimOther is for findings/facts that can't be attributed to a known dimension.
+const dimOther = "other"
+
+var dimensionOrder = []string{
+	dimRecon, dimAuthz, dimInjection, dimUpload, dimSSRF, dimRCE,
+	dimCredReuse, dimDataExport, dimPayment, dimPrivesc, dimLateral,
+}
+
+var dimensionLabels = map[string]string{
+	dimRecon:      "侦察/枚举",
+	dimAuthz:      "越权/未授权",
+	dimInjection:  "注入",
+	dimUpload:     "上传/解析",
+	dimSSRF:       "SSRF/回连",
+	dimRCE:        "命令执行/反序列化",
+	dimCredReuse:  "凭据复用",
+	dimDataExport: "数据导出",
+	dimPayment:    "支付/订单",
+	dimPrivesc:    "提权",
+	dimLateral:    "横向",
+	dimOther:      "未归类",
+}
+
+var dimensionTips = map[string]string{
+	dimRecon:      "对资产做 DNS/端口/指纹/目录与接口发现，结果写回资产。",
+	dimAuthz:      "用 A/B 双身份对照：无 token、空 token、换对象 id、普通用户访问管理接口。",
+	dimInjection:  "对参数位/JSON 字段/cookie 做只读注入探测（sqlmap level2 risk1 或等价手工 payload）。",
+	dimUpload:     "找上传入口，测类型/后缀/内容/路径绕过（只验证能力，不落地后门）。",
+	dimSSRF:       "检查 URL 参数、图片代理、webhook、导出回调；用回连验证。",
+	dimRCE:        "按组件指纹查 CVE 后实际触发；无组件线索就记录不适用。",
+	dimCredReuse:  "用已获凭据尝试同集群/同模板的登录与接口，先查锁定策略。",
+	dimDataExport: "对已证明可达的接口做最小只读取数证明，记录字段与条数。",
+	dimPayment:    "测金额/数量/优惠券/订单归属/回调验签/退款幂等，用沙箱或测试商户。",
+	dimPrivesc:    "从当前权限尝试提权路径，记录前置条件与验证结果。",
+	dimLateral:    "从当前立足点尝试横向可达性，只打已证明归属的网段。",
+	dimOther:      "无法归类的发现，人工复核。",
+}
+
+// DimensionOrder returns the canonical display/aggregation order.
+func DimensionOrder() []string {
+	out := make([]string, len(dimensionOrder))
+	copy(out, dimensionOrder)
+	return out
+}
+
+func DimensionLabel(d string) string {
+	if s, ok := dimensionLabels[d]; ok {
+		return s
+	}
+	if d == "" {
+		return dimensionLabels[dimOther]
+	}
+	return d
+}
+
+func DimensionTip(d string) string { return dimensionTips[d] }
+
+func DimensionKnown(d string) bool {
+	_, ok := dimensionLabels[d]
+	return ok
+}
+
 // IsExploitDimension 判断该维度是否属于「利用/深挖」类：这类意图经常需要
 // 连续几十次请求、多步链（拿凭据→登录→提权→取数），租约墙钟要放宽。
 func IsExploitDimension(dim string) bool {

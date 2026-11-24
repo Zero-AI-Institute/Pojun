@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/chu0119/pojun/agent"
 	"github.com/chu0119/pojun/db"
 )
 
@@ -56,8 +57,12 @@ func (e *Engine) maybeExtendAutopilot(t *Task) bool {
 	}
 
 	untested := 0
+	var matrix *agent.CoverageMatrix
 	if e.m.assets != nil {
-		if _, total, err := e.m.assets.ListUntestedAssetsWithSources(taskID, "", 1, 0); err == nil {
+		matrix = agent.CoverageMatrixForTask(e.m.assets, t.Store, taskID)
+		if matrix != nil {
+			untested = matrix.UntestedAssets
+		} else if _, total, err := e.m.assets.ListUntestedAssetsWithSources(taskID, "", 1, 0); err == nil {
 			untested = total
 		}
 	}
@@ -96,6 +101,17 @@ func (e *Engine) maybeExtendAutopilot(t *Task) bool {
 	stage := ladder[len(ladder)-1]
 	if used < len(ladder) {
 		stage = ladder[used]
+	}
+	// v0.4.100：续到「未覆盖面清零」这一波时，用覆盖率矩阵点名最该补的格子，
+	// 不再只给一句模板话。
+	if used == 3 && matrix != nil && len(matrix.TopGaps) > 0 {
+		g := matrix.TopGaps[0]
+		samples := strings.Join(g.Samples, "、")
+		if samples == "" {
+			samples = "见 list_untested_assets"
+		}
+		stage = fmt.Sprintf("未覆盖面清零：优先补 %s 类资产的【%s】（%d 个未测，样本：%s）；用对应打法逐资产验证，不适用的用 fact 说明。",
+			g.AssetType, agent.DimensionLabel(g.Dimension), g.Untested, samples)
 	}
 	txt := fmt.Sprintf("%s（续杯第 %d 波：已登记高危 %d 条、未测资产 %d 个）", stage, used+1, highFindings, untested)
 	texts := []string{txt}

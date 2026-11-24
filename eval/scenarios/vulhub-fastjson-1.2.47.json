@@ -1,0 +1,25 @@
+{
+  "id": "vulhub-fastjson-1.2.47",
+  "name": "Fastjson 1.2.47 反序列化 RCE",
+  "source": "vulhub",
+  "target": "http://127.0.0.1:8090",
+  "setup": "cd vulhub/fastjson/1.2.47-rce && docker compose up -d",
+  "goal": "通过 Fastjson 反序列化取得命令执行证据",
+  "stages": [
+    "recon",
+    "injection",
+    "rce"
+  ],
+  "max_minutes": 50,
+  "expected": [
+    {
+      "vulnclass": "反序列化",
+      "severity": "critical"
+    },
+    {
+      "vulnclass": "RCE",
+      "optional": true
+    }
+  ],
+  "require_goal": false
+}

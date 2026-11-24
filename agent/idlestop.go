@@ -86,8 +86,9 @@ const (
 	//
 	// 存在的意义：worker 刚起手的前几轮可能在做准备工作（建工作目录、读前期
 	// 事实、拉取目标信息），这些轮次不写回是正常的。给它一段起跑宽限期，
-	// 避免开局就被判定为空转。
-	idleStopMinElapsed = 3 * time.Minute
+	// 避免开局就被判定为空转。v0.4.105 起基线为 300s：价值分高的方向会被
+	// 动态延长，低价值方向仍可在 3 轮时先 SOFT_WARN，不靠缩短宽限期抢时间。
+	idleStopMinElapsed = 5 * time.Minute
 
 	// idleStopPreventRounds 是「提示后仍无写回」多久才真收场。
 	//
@@ -96,6 +97,20 @@ const (
 	// 调用都 blocked 但 run 不结束，模型跟 hook 逐轮辩论烧 token（线上实测
 	// 单条意图被拦到「连续 20 轮」才结束，journal 里 2583 条收场日志）。
 	idleStopPreventRounds = 5
+
+	// v0.4.105 价值分阈值（P1-2）。价值分是「最近工具行为的产出期望」，
+	// 不是模型自述：写回/深度验证/高价值资产命中加分，工具失败/连续空转衰减。
+	//
+	//   score >= 2.0 → 阈值从 3 延到 5 轮（正在深挖，给它时间）
+	//   score >= 5.0 → 阈值延到 7 轮（高价值链，别在突破前掐断）
+	//   失败率 >= 60% 且 score < 1.0 → 阈值缩到 2 轮（工具/环境在坏，先收）
+	idleStopValueExtend  = 2.0
+	idleStopValueHigh    = 5.0
+	idleStopValueLow     = 1.0
+	idleStopLowFailRatio = 0.6
+	idleStopLowFailMin   = 3
+	idleStopHighRounds   = 5
+	idleStopMaxRounds    = 7
 )
 
 // idleStopper 在一轮 worker run 内跟踪「连续无写回的轮数」，到阈值就要求收场。
@@ -128,6 +143,118 @@ type idleStopper struct {
 	mu sync.Mutex
 	// reason 记录收场原因，落日志/落库用。
 	reason string
+	// value 是本 run 的价值分（v0.4.105）：决定空转阈值是延长还是缩短。
+	value valueTracker
+}
+
+// valueTracker 把最近工具行为折算成一个带衰减的价值分。
+//
+// 它刻意不看模型说了什么（模型可以自称"快突破了"），只看可核对的信号：
+//   - 写回：record_fact / report_finding / save_evidence / insert_assets；
+//   - 深度验证：audit_finding、带 verification_strategy 的 finding；
+//   - 高价值命中：高权限/数据面/敏感端口的资产或入口；
+//   - 工具成功率：连续失败说明环境/路径在坏，继续烧 token 没意义。
+//
+// 分数每次工具执行后衰减 10%（observe 内），所以它衡量的是"最近的产出期望"，
+// 不是总产出。
+type valueTracker struct {
+	score         float64
+	success       int
+	failure       int
+	depthProgress int
+	highValueHits int
+}
+
+func (v *valueTracker) observe(name string, input []byte, isErr bool) {
+	v.decay()
+	if isErr {
+		v.failure++
+		v.score -= 0.6
+	} else {
+		v.success++
+		v.score += 0.05
+		switch name {
+		case "record_fact":
+			v.score += 1.2
+		case "report_finding":
+			v.score += 2.4
+			low := strings.ToLower(string(input))
+			if strings.Contains(low, "critical") || strings.Contains(low, `"high"`) {
+				v.score += 0.8
+			}
+			if strings.Contains(low, "verification_strategy") {
+				v.score += 0.8
+				v.depthProgress++
+			}
+		case "save_evidence":
+			v.score += 0.9
+		case "insert_assets":
+			v.score += 0.7
+			if n := highValueAssetHits(input); n > 0 {
+				v.score += float64(n) * 0.4
+				v.highValueHits += n
+			}
+		case "audit_finding":
+			v.score += 2.5
+			v.depthProgress++
+		case "search_experience":
+			v.score += 0.5
+		case "http_request", "session_login", "Bash", "WebFetch":
+			v.score += 0.1
+		case "graph_overview", "list_facts", "list_findings", "node_detail", "get_worker_output", "get_worker_trace":
+			v.score += 0.05
+		}
+		// 探测输入里出现高权限/数据面入口，给一点正向信号。只在"新命中"的前
+		// 5 次加分——否则反复扫同一批 admin 路径会靠关键词把价值分刷高，正好
+		// 保护了最该被收掉的空转扫描。
+		if v.highValueHits < 5 && name != "insert_assets" && name != "report_finding" && inputHighValue(string(input)) {
+			v.score += 0.4
+			v.highValueHits++
+		}
+	}
+	if v.score < 0 {
+		v.score = 0
+	}
+	if v.score > 20 {
+		v.score = 20
+	}
+}
+
+func (v *valueTracker) decay() { v.score *= 0.9 }
+
+func (v *valueTracker) failRatio() float64 {
+	total := v.success + v.failure
+	if total == 0 {
+		return 0
+	}
+	return float64(v.failure) / float64(total)
+}
+
+// highValueAssetHits 从 insert_assets 的入参里数高价值资产（高权限/数据面/敏感端口）。
+func highValueAssetHits(input []byte) int {
+	low := strings.ToLower(string(input))
+	if !inputHighValue(low) {
+		return 0
+	}
+	if strings.Contains(low, "admin") || strings.Contains(low, "manage") ||
+		strings.Contains(low, "export") || strings.Contains(low, "upload") {
+		return 2
+	}
+	return 1
+}
+
+func inputHighValue(input string) bool {
+	low := strings.ToLower(input)
+	for _, kw := range []string{
+		"admin", "manage", "internal", "export", "upload", "token", "jwt",
+		"secret", "actuator", "swagger", "graphql", "debug", "/api/",
+		":3306", ":6379", ":9200", ":27017", ":8080", ":8443",
+	} {
+		if strings.Contains(low, kw) {
+			return true
+		}
+	}
+	return false
 }
 
 func newIdleStopper(writes func() WriteCounts) *idleStopper {
@@ -152,11 +279,12 @@ func (s *idleStopper) check() (prevent bool, reason string) {
 	}
 	// 这一轮过去了，计数 +1。
 	s.rounds++
+	s.value.decay()
 	// 起跑宽限期内不收场。
 	if time.Since(s.start) < idleStopMinElapsed {
 		return false, ""
 	}
-	if s.rounds < idleStopRounds {
+	if s.rounds < s.thresholdLocked() {
 		return false, ""
 	}
 	// 已经达过阈值：持续返回 prevent。
@@ -164,7 +292,7 @@ func (s *idleStopper) check() (prevent bool, reason string) {
 		return true, s.reason
 	}
 	s.stopped = true
-	s.reason = fmt.Sprintf("连续%d轮无写回（本轮写回 %d 条，产出率已归零）", s.rounds, s.totalLocked())
+	s.reason = s.reasonLocked()
 	return true, s.reason
 }
 
@@ -186,10 +314,10 @@ func (s *idleStopper) peek() (prevent bool, reason string) {
 	if time.Since(s.start) < idleStopMinElapsed {
 		return false, ""
 	}
-	if s.rounds < idleStopRounds {
+	if s.rounds < s.thresholdLocked() {
 		return false, ""
 	}
-	return true, fmt.Sprintf("连续%d轮无写回（本轮写回 %d 条，产出率已归零）", s.rounds, s.totalLocked())
+	return true, s.reasonLocked()
 }
 
 // advance 记一轮过去（一次工具执行）。
@@ -205,6 +333,46 @@ func (s *idleStopper) advance() {
 		return
 	}
 	s.rounds++
+}
+
+// observeTool 记录一次工具执行的产出信号（成功/失败、写回、深度验证、高价值命中）。
+// 与 rounds 分开：写回类工具也会被观察，但它们不推进空转计数。
+func (s *idleStopper) observeTool(name string, input []byte, isErr bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.value.observe(name, input, isErr)
+}
+
+// thresholdLocked 根据价值分决定「连续多少轮无写回才进入 SOFT_WARN」。
+// 高价值方向动态延长，工具持续失败的低价值方向缩短。调用方持有 s.mu。
+func (s *idleStopper) thresholdLocked() int {
+	th := idleStopRounds
+	switch {
+	case s.value.score >= idleStopValueHigh:
+		th = idleStopMaxRounds
+	case s.value.score >= idleStopValueExtend:
+		th = idleStopHighRounds
+	}
+	if s.value.failure >= idleStopLowFailMin && s.value.failRatio() >= idleStopLowFailRatio && s.value.score < idleStopValueLow {
+		if th > 2 {
+			th = 2
+		}
+	}
+	return th
+}
+
+// preventRoundsLocked 是「提示后仍无写回」的真收场轮。高价值方向延长后，
+// prevent 必须跟着后移（至少 nudge+2），否则 nudge 和终止会落在同一轮。
+func (s *idleStopper) preventRoundsLocked() int {
+	if th := s.thresholdLocked(); th+2 > idleStopPreventRounds {
+		return th + 2
+	}
+	return idleStopPreventRounds
+}
+
+func (s *idleStopper) reasonLocked() string {
+	return fmt.Sprintf("连续%d轮无写回（本轮写回 %d 条，产出率已归零；价值分 %.1f，工具成功 %d/失败 %d，深挖 %d，高价值命中 %d）",
+		s.rounds, s.totalLocked(), s.value.score, s.value.success, s.value.failure, s.value.depthProgress, s.value.highValueHits)
 }
 
 // refreshLocked 在有新增写回时清零计数，返回「本轮是否有产出」。
@@ -244,6 +412,20 @@ func (s *idleStopper) advancedSinceNudge() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.rounds > s.nudgedRound
+}
+
+// currentRounds / preventRounds 是并发安全的只读快照（PreToolUse 与 PostToolUse
+// 可能并发，直接读 s.rounds 会与 advance 竞争）。
+func (s *idleStopper) currentRounds() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.rounds
+}
+
+func (s *idleStopper) preventRounds() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.preventRoundsLocked()
 }
 
 // idleStopHooks 把 idleStopper 挂在 harness 的 hook 链上。
@@ -327,7 +509,7 @@ func (h *idleStopHooks) PreToolUse(ctx context.Context, name string, input []byt
 	// 真正收场（block 只拦单次工具调用，不 cancel 的话模型会逐轮跟 hook 辩论）。
 	// **nudge 之后必须至少推进过一轮工具执行**才允许收场——同轮并发调用的其余
 	// tool_use 不能直接跳到终结（issue #8）。
-	if h.stop.rounds >= idleStopPreventRounds && h.stop.advancedSinceNudge() {
+	if h.stop.currentRounds() >= h.stop.preventRounds() && h.stop.advancedSinceNudge() {
 		// 先记原因（落日志/可落库），再取消 run context；cancel 缺省时退化为
 		// 只拦截——由 Stop hook 的 prevent 路径兜底收场。
 		if h.onStop != nil {
@@ -350,6 +532,8 @@ func (h *idleStopHooks) PostToolUse(ctx context.Context, name string, input, res
 	if h.inner != nil {
 		h.inner.PostToolUse(ctx, name, input, result, isErr)
 	}
+	// 价值分先记：写回类工具虽然不推进空转计数，但它们的产出信号要计入价值分。
+	h.stop.observeTool(name, input, isErr)
 	// 写回类工具不推进计数（它是结束动作，见 idleStopWriteTools 的说明）。
 	if idleStopWriteTools[name] {
 		return
@@ -376,15 +560,15 @@ func (h *idleStopHooks) Stop(ctx context.Context, messages []llm.Message) (bool,
 	h.mu.Lock()
 	alreadyNudged := h.nudged
 	h.nudged = true
-	rounds := h.stop.rounds
+	rounds := h.stop.currentRounds()
 	h.mu.Unlock()
 	if !alreadyNudged {
 		// 第一次触发：给模型一次把已确认结果写回的机会。
 		return false, []string{idleStopMessage}, ""
 	}
 	// 提示后仍无写回：到 prevent 轮才真收场（未到只提醒，避免 Stop 路径
-	// 比 PreToolUse 更早切断）。
-	if rounds < idleStopPreventRounds {
+	// 比 PreToolUse 更早切断）。prevent 轮随价值分动态后移。
+	if rounds < h.stop.preventRounds() {
 		return false, []string{idleStopMessage + "（请立即写回并停止调用工具；再继续将结束本轮）"}, ""
 	}
 	if h.onStop != nil {
@@ -428,6 +612,7 @@ const idleStopMessage = "本轮已连续多轮没有任何写回——这个方�
 	"   - 结论/观察/排除 → record_fact（**负结果也算**：「测了 X，无 Y，现象 Z」是一条事实）\n" +
 	"   - 新资产 → insert_assets；确认漏洞 → report_finding；现场证据 → save_evidence\n" +
 	"2. 写回完成后，用一句话纯文本总结你探到了什么、卡在哪里，结束本轮。\n\n" +
+	"3. 若本轮已有高价值验证结果（critical/high、audit 通过、已拿到数据样本），**先 report_finding + save_evidence，再 record_fact**——不要只留一段文字总结，那不算落库。\n\n" +
 	"这不是惩罚，是给你一次把成果落库的机会——已写回的内容全部保留。不要为了「有产出」把没验证的猜测写成事实。"
 
 // logIdleStop 记一条收场日志（统一格式，便于事后统计）。

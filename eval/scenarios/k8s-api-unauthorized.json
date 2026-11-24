@@ -1,0 +1,25 @@
+{
+  "id": "k8s-api-unauthorized",
+  "name": "Kubernetes API 未授权访问",
+  "source": "infra",
+  "target": "https://127.0.0.1:6443",
+  "setup": "kind/minikube 暴露匿名访问（仅隔离靶场）",
+  "goal": "证明 Kubernetes API 可匿名读取敏感资源",
+  "stages": [
+    "recon",
+    "authz",
+    "data-export"
+  ],
+  "max_minutes": 35,
+  "expected": [
+    {
+      "vulnclass": "未授权访问",
+      "severity": "critical"
+    },
+    {
+      "vulnclass": "信息泄露",
+      "optional": true
+    }
+  ],
+  "require_goal": false
+}

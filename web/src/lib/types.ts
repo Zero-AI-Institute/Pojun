@@ -44,6 +44,133 @@ export interface Task {
   auth_config?: TaskAuthConfigView;
 }
 
+// ---- 任务出口回执（issue #39，只读快照） ----
+export type TaskEgressKind =
+  | "recording_proxy"
+  | "proxy_pool"
+  | "global_proxy"
+  | "direct"
+  | "strict_block";
+
+export interface TaskEgressEndpoint {
+  scheme?: string;
+  host?: string;
+  port?: string;
+  address?: string; // 已脱敏展示串：scheme://host[:port]
+  has_auth: boolean;
+  parse_ok: boolean;
+}
+
+export interface TaskEgressRoute extends TaskEgressEndpoint {
+  kind: TaskEgressKind;
+}
+
+export interface TaskEgressRole extends TaskEgressRoute {
+  role: string; // worker / planner / mainagent
+}
+
+export interface TaskEgressUpstream extends TaskEgressEndpoint {
+  kind: TaskEgressKind;
+  note?: string;
+}
+
+export interface TaskEgressCapture {
+  enabled: boolean; // settings.traffic_capture（构建时）
+  injected: boolean; // Agent 是否真的被注入记录代理地址
+  effective: boolean; // 记录代理是否在监听（running）
+  ca_present: boolean;
+  note?: string; // capture 边界说明（passthrough 不录制等）
+}
+
+export interface TaskEgressPool {
+  configured: boolean;
+  available: number;
+  strategy?: string;
+}
+
+export interface TaskEgressObserved {
+  known: boolean; // 构建期恒为 false
+  reason?: string;
+}
+
+export interface TaskEgressUASurface {
+  id: string;
+  scope: string; // native / shell / platform / external
+  class: "platform_fixed" | "runtime_default" | "tool_own" | string;
+  value?: string;
+  note?: string;
+  override?: string[];
+}
+
+export interface TaskEgressUA {
+  task_level_override: string; // none
+  observation: string; // declaration_only
+  note: string;
+  surfaces: TaskEgressUASurface[];
+}
+
+export interface TaskEgressPlatformSurface {
+  id: string;
+  scope: string; // platform / external
+  egress: string; // live_proxy_addr：每次调用实时解析
+  override?: string[];
+  note?: string;
+}
+
+export interface TaskEgressPlatform {
+  surfaces: TaskEgressPlatformSurface[];
+  note: string;
+}
+
+export interface TaskEgressSnapshot {
+  schema_version: number;
+  source: string;
+  captured_at: string;
+  build_version?: string;
+  capture: TaskEgressCapture;
+  strict_egress: boolean;
+  pool: TaskEgressPool;
+  upstream?: TaskEgressUpstream; // 仅捕获开：MITM 上游策略（声明，非实际 IP）
+  egress: TaskEgressRoute; // worker 的实际出口
+  roles: TaskEgressRole[];
+  roles_uniform: boolean;
+  observed: TaskEgressObserved;
+  platform_surfaces?: TaskEgressPlatform; // 旁路执行面：每次调用实时解析出口
+  ua: TaskEgressUA;
+}
+
+export interface TaskEgressResponse {
+  task_id: string;
+  built: boolean;
+  reason?: string;
+  compatible?: boolean; // false = 快照格式本端无法理解（不解包）
+  schema_version?: number;
+  snapshot?: TaskEgressSnapshot;
+}
+
+// ---- SRC/众测 program profile（v0.4.112，任务级） ----
+export interface ProgramProfile {
+  platform?: string; // hackerone/bugcrowd/intigriti/yeswehack/other
+  handle?: string;
+  scope?: string[];
+  excluded?: string[];
+  scanners_allowed?: string[];
+  allow_race?: boolean;
+  dry_run?: boolean;
+  rps?: number; // 0/缺省 = 不限速
+  allowed_hosts?: string[]; // 原生 HTTP allowlist；空=不限
+  denied_hosts?: string[]; // deny 优先
+  window_start?: string; // HH:MM
+  window_end?: string;
+  timezone?: string; // IANA
+  max_concurrent?: number; // 0=不限
+}
+
+export interface TaskProgramProfileResponse {
+  task_id: string;
+  profile: ProgramProfile | null;
+}
+
 export interface TaskCategory {
   id: number;
   name: string;
@@ -1064,6 +1191,11 @@ export interface Settings {
   intent_budget_tokens?: number;
   intent_budget_minutes?: number; // v0.4.92 墙钟预算（0=关）
   intent_budget_mode?: string;    // soft | hard // 默认 3000000，范围 500000–20000000
+  // 任务级预算（v0.4.101）：0=不限；80% 预警、100% 收尾。
+  task_budget_tokens?: number;
+  task_budget_usd?: number;
+  task_budget_minutes?: number;
+  task_budget_warn_pct?: number; // 默认 80，范围 50–95
   // 证据逐字回验（v0.4.29）：off=关闭 / warn=只提示（默认）/ block=critical/high 无出处打回。
   finding_evidence_verify?: "off" | "warn" | "block";
   // 工具输出注入告警（v0.4.29）：命中高精度注入特征时提醒模型「当数据不当指令」。
@@ -1377,6 +1509,46 @@ export interface MCPServer {
   enabled: boolean;
   insecure?: boolean; // http: skip TLS cert verification (self-signed servers)
   tools?: string[]; // mcp_tools_cache (names only, for the count)
+  // 健康检查（v0.4.107）：last_ok 为空 = 从未检查；last_error 已脱敏。
+  last_check_at?: string;
+  last_ok?: boolean | null;
+  last_error?: string;
+  last_latency_ms?: number;
+  tool_count?: number;
+}
+
+// ---- 确定性回归检查（v0.4.119） ----
+export interface FindingRegression {
+  id: string;
+  finding_id: string;
+  task_id?: string;
+  vulnclass: string;
+  baseline_traffic_id?: string;
+  proof_traffic_id: string;
+  method: string;
+  url: string;
+  assertion: "status" | "token" | "diff" | string;
+  expected_status: number;
+  token?: string;
+  created_at: string;
+  last_checked_at?: string;
+  last_verdict?: string;
+  last_note?: string;
+}
+
+export interface FindingRegressionResponse {
+  finding_id: string;
+  regression: FindingRegression | null;
+}
+
+export interface FindingRegressionCheck {
+  finding_id: string;
+  verdict: "pass" | "fail" | "inconclusive" | "not_replayable" | string;
+  note: string;
+  status: number;
+  matched: boolean;
+  assertion: string;
+  regression?: FindingRegression;
 }
 
 export interface MCPTool {

@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log"
 	"os/exec"
+	"regexp"
+	"strings"
 	"time"
 
 	"github.com/Autumn-27/norma/mcp"
@@ -12,6 +14,11 @@ import (
 	"github.com/chu0119/pojun/db"
 	"github.com/chu0119/pojun/mcphttp"
 )
+
+// mcpHealthCheckTimeout 是单个 MCP 启动/手动健康检查的上限。首次 npx 拉包
+// 可能较慢（线上实测 browser MCP 冷启动 26s），30s 会误报；45s 与手动 refresh
+// 的上限一致，同时多个坏服务器串行也不会无限拖住启动自检。
+const mcpHealthCheckTimeout = 45 * time.Second
 
 // mcpClient is the shared surface of a connected MCP server (stdio, Streamable HTTP,
 // or legacy SSE),
@@ -52,13 +59,16 @@ func connectMCP(ctx context.Context, m *db.MCPServer) (mcpClient, error) {
 // discoverAndCacheMCP connects to one MCP, lists its tools, and persists the tool
 // names to mcp_tools_cache so the UI shows them without a live connection.
 func (s *Server) discoverAndCacheMCP(ctx context.Context, m *db.MCPServer) error {
+	start := time.Now()
 	cl, err := connectMCP(ctx, m)
 	if err != nil {
+		s.recordMCPHealth(m, false, start, err)
 		return err
 	}
 	defer cl.Close()
 	ts, err := cl.Tools(ctx)
 	if err != nil {
+		s.recordMCPHealth(m, false, start, err)
 		return err
 	}
 	tools := make([]db.MCPTool, 0, len(ts))
@@ -66,29 +76,91 @@ func (s *Server) discoverAndCacheMCP(ctx context.Context, m *db.MCPServer) error
 		tools = append(tools, db.MCPTool{Name: t.Name(), Description: t.Description()})
 	}
 	if err := s.m.pg.SaveMCPTools(m.ID, tools); err != nil {
+		s.recordMCPHealth(m, false, start, err)
 		return err
 	}
-	log.Printf("[mcp] %s 发现 %d 个工具并已缓存", m.Name, len(tools))
+	s.recordMCPHealth(m, true, start, nil, len(tools))
+	log.Printf("[mcp] %s 健康检查通过：%d 个工具，%dms", m.Name, len(tools), time.Since(start).Milliseconds())
 	return nil
 }
 
-// discoverEmptyMCPsOnStartup fills the tool cache for any enabled MCP that has none
-// yet (notably the seeded browser MCP on first run). Runs sequentially in one
-// goroutine so we never spawn many stdio servers (npx) at once, and never blocks
-// startup. Best-effort: a failure leaves the cache empty to retry next start.
-func (s *Server) discoverEmptyMCPsOnStartup() {
+// recordMCPHealth persists one check result (best-effort) and updates the
+// in-memory failure cooldown so agent runs don't immediately re-dial a server
+// that just failed at startup.
+func (s *Server) recordMCPHealth(m *db.MCPServer, ok bool, start time.Time, cause error, toolCount ...int) {
+	if s == nil || s.m == nil || s.m.pg == nil || m == nil || m.ID == 0 {
+		return
+	}
+	latency := time.Since(start)
+	msg := ""
+	if ok {
+		clearMCPFailure(m.Name)
+	} else {
+		msg = redactMCPError(m, cause)
+		markMCPFailed(m.Name, 10*time.Minute)
+	}
+	n := 0
+	if len(toolCount) > 0 {
+		n = toolCount[0]
+	}
+	if err := s.m.pg.SaveMCPHealth(m.ID, ok, latency, msg, n); err != nil {
+		log.Printf("[mcp] %s 健康结果写入失败: %v", m.Name, err)
+	}
+}
+
+var (
+	// URL userinfo 与 query 可能带 token；错误信息进 DB/UI 前统一脱敏。
+	mcpURLUserInfoRe = regexp.MustCompile(`(?i)(https?://)[^/\s@]+@`)
+	mcpURLQueryRe    = regexp.MustCompile(`\?[^\s"']+`)
+)
+
+// redactMCPError makes an MCP error safe to persist and show in the UI:
+//   - env values (API keys / headers) are replaced with ***;
+//   - URL userinfo and query strings are stripped;
+//   - newlines collapsed and the result capped at 500 runes.
+func redactMCPError(m *db.MCPServer, cause error) string {
+	if cause == nil {
+		return ""
+	}
+	msg := cause.Error()
+	if m != nil {
+		for _, v := range jsonStrMap(m.Env) {
+			if len(v) >= 6 {
+				msg = strings.ReplaceAll(msg, v, "***")
+			}
+		}
+	}
+	msg = mcpURLUserInfoRe.ReplaceAllString(msg, "${1}***@")
+	msg = mcpURLQueryRe.ReplaceAllString(msg, "?***")
+	msg = strings.Join(strings.Fields(msg), " ")
+	if msg == "" {
+		msg = "连接失败（无错误详情）"
+	}
+	r := []rune(msg)
+	if len(r) > 500 {
+		msg = string(r[:500]) + "…"
+	}
+	return msg
+}
+
+// checkMCPHealthOnStartup verifies every enabled MCP, not just those with an
+// empty tool cache (v0.4.107). A stale cache previously made a dead server look
+// healthy forever; now startup records last_ok/last_error/latency/tool_count so
+// the UI can show it. Sequential by design: never spawn many stdio servers at
+// once. Best-effort and async — startup never blocks on it.
+func (s *Server) checkMCPHealthOnStartup() {
 	servers, err := s.m.pg.ListMCP()
 	if err != nil {
-		log.Printf("[mcp] 启动自动发现: 读取列表失败: %v", err)
+		log.Printf("[mcp] 启动健康检查: 读取列表失败: %v", err)
 		return
 	}
 	for _, m := range servers {
-		if !m.Enabled || len(m.Tools) > 0 {
+		if !m.Enabled {
 			continue
 		}
-		ctx, cancel := context.WithTimeout(s.ctx, 90*time.Second)
+		ctx, cancel := context.WithTimeout(s.ctx, mcpHealthCheckTimeout)
 		if err := s.discoverAndCacheMCP(ctx, m); err != nil {
-			log.Printf("[mcp] 启动自动发现 %s 失败: %v", m.Name, err)
+			log.Printf("[mcp] 启动健康检查 %s 失败: %v", m.Name, err)
 		}
 		cancel()
 	}

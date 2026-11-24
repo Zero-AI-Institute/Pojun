@@ -673,6 +673,24 @@ func (d *DB) GetFinding(id int64) (*DBFinding, error) {
 // originating exploration node (kind='finding'), so it disappears from the findings
 // list, the per-task 发现 Tab, and the exploration graph alike. Deleting the node
 // cascades its edges + node_assets and nulls any activity referencing it. Returns
+// Finding loads one finding and verifies its originating node belongs to this
+// exploration. Returns (nil, nil) when the finding does not exist or belongs to
+// another task — callers must not leak cross-task findings.
+func (s *ExplorationStore) Finding(id int64) (*DBFinding, error) {
+	f, err := s.db.GetFinding(id)
+	if err != nil || f == nil || f.NodeID == nil {
+		return nil, err
+	}
+	n, err := s.GetNode(*f.NodeID)
+	if err != nil {
+		return nil, err
+	}
+	if n == nil || n.Kind != KindFinding {
+		return nil, nil
+	}
+	return f, nil
+}
+
 // rows affected (0 = no finding with that id).
 func (d *DB) DeleteFinding(id int64) (n int64, err error) {
 	err = d.WithEvidenceTx(context.Background(), func(tx *sql.Tx) error {

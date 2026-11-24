@@ -28,9 +28,88 @@ import { SidebarTrigger } from "@/components/ui/sidebar";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { api } from "@/lib/api";
 import { statusMeta } from "@/lib/status";
-import type { Finding, FindingStatus, Severity, TaskArtifact } from "@/lib/types";
+import type { Finding, FindingRegressionResponse, FindingStatus, Severity, TaskArtifact } from "@/lib/types";
 
 import { FindingLineageView } from "./lineage";
+
+// 确定性回归检查（v0.4.119）：只回放 finding 已绑定的 proof 流量；POST 等
+// 状态变更请求需显式勾选 allow_write，避免点一下按钮就重复提交副作用。
+function FindingRegressionCard({ findingId, readOnly }: { findingId: string; readOnly?: boolean }) {
+  const [data, setData] = React.useState<FindingRegressionResponse | null>(null);
+  const [loading, setLoading] = React.useState(true);
+  const [checking, setChecking] = React.useState(false);
+  const [allowWrite, setAllowWrite] = React.useState(false);
+  const [result, setResult] = React.useState<{ verdict: string; note: string; status: number } | null>(null);
+
+  React.useEffect(() => {
+    let alive = true;
+    setLoading(true);
+    api.findingRegression(findingId)
+      .then((r) => { if (alive) setData(r); })
+      .catch(() => { if (alive) setData(null); })
+      .finally(() => { if (alive) setLoading(false); });
+    return () => { alive = false; };
+  }, [findingId]);
+
+  const reg = data?.regression ?? null;
+  const safe = !reg || ["", "GET", "HEAD", "OPTIONS"].includes((reg.method || "").toUpperCase());
+
+  async function runCheck() {
+    setChecking(true);
+    try {
+      const r = await api.checkFindingRegression(findingId, allowWrite);
+      setResult({ verdict: r.verdict, note: r.note, status: r.status });
+      toast.success(`回归检查：${r.verdict}`);
+    } catch (e) {
+      toast.error(`回归检查失败：${(e as Error).message}`);
+    } finally {
+      setChecking(false);
+    }
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-sm">确定性回归检查</CardTitle>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-3 text-sm">
+        {loading ? <p className="text-muted-foreground text-sm">加载中…</p> : null}
+        {!loading && !reg ? (
+          <p className="text-muted-foreground text-sm">
+            该漏洞没有可重放的 proof 流量（或验证未通过），未生成回归 spec。需要回归时请先绑定 proof 流量并重新上报。
+          </p>
+        ) : null}
+        {reg ? (
+          <>
+            <div className="flex flex-wrap items-center gap-2 text-xs">
+              <Badge variant="outline">{reg.assertion}</Badge>
+              <code className="truncate font-mono">{reg.method} {reg.url}</code>
+              {reg.last_verdict ? <Badge variant={reg.last_verdict === "pass" ? "secondary" : "destructive"}>{reg.last_verdict}</Badge> : null}
+            </div>
+            {reg.last_note ? <p className="text-muted-foreground text-xs">{reg.last_note}</p> : null}
+            <div className="flex flex-wrap items-center gap-3">
+              {!safe ? (
+                <label className="flex items-center gap-2 text-xs">
+                  <input type="checkbox" checked={allowWrite} onChange={(e) => setAllowWrite(e.target.checked)} />
+                  允许重放状态变更请求（{reg.method}）
+                </label>
+              ) : null}
+              <Button size="sm" variant="outline" disabled={checking || readOnly || (!safe && !allowWrite)} onClick={() => void runCheck()}>
+                {checking ? "检查中…" : "运行回归检查"}
+              </Button>
+              {readOnly ? <span className="text-muted-foreground text-xs">继承漏洞只读</span> : null}
+            </div>
+            {result ? (
+              <p className={result.verdict === "pass" ? "text-xs text-emerald-600" : "text-xs text-destructive"}>
+                {result.verdict} · HTTP {result.status} · {result.note}
+              </p>
+            ) : null}
+          </>
+        ) : null}
+      </CardContent>
+    </Card>
+  );
+}
 
 const SEVERITIES: Severity[] = ["critical", "high", "medium", "low"];
 const FINDING_STATUSES: FindingStatus[] = [
@@ -243,6 +322,7 @@ function FindingDetailInner() {
                 onChanged={load}
               />
               {/* 复测记录放最后：属于验证后的后续动作。 */}
+              <FindingRegressionCard key={`regression-${id}`} findingId={id} readOnly={finding.inherited} />
               <FindingRetestPanel key={`retest-${id}`} findingId={id} readOnly={finding.inherited} onCompleted={load} />
             </div>
 

@@ -158,6 +158,36 @@ const mcpPresets: MCPPreset[] = [
   },
 ];
 
+// 旧库/未检查的服可能只有 mcp_tools_cache 没有 tool_count，两者取大值。
+function mcpToolCount(server: MCPServer): number {
+  return Math.max(server.tool_count ?? 0, server.tools?.length ?? 0);
+}
+
+// McpHealthBadge 展示最近一次启动/手动检查的结果：未检查 / 健康（延迟）/ 异常。
+// 异常时 title 带脱敏错误，卡片正文还会显示一行错误摘要。
+function McpHealthBadge({ server }: { server: MCPServer }) {
+  if (!server.enabled) {
+    return <Badge variant="outline">已停用</Badge>;
+  }
+  if (server.last_ok == null) {
+    return <Badge variant="outline">未检查</Badge>;
+  }
+  if (server.last_ok) {
+    return (
+      <Badge variant="secondary" className="gap-1" title={server.last_check_at}>
+        <span className="size-1.5 rounded-full bg-emerald-500" />
+        健康
+        {server.last_latency_ms ? ` · ${server.last_latency_ms}ms` : ""}
+      </Badge>
+    );
+  }
+  return (
+    <Badge variant="destructive" title={server.last_error || "健康检查失败"}>
+      异常
+    </Badge>
+  );
+}
+
 export default function MCPPage() {
   const [servers, setServers] = React.useState<MCPServer[]>([]);
   const [agents, setAgents] = React.useState<Agent[]>([]);
@@ -556,6 +586,7 @@ export default function MCPPage() {
                 <Badge variant="outline" className="uppercase">
                   {s.transport}
                 </Badge>
+                <McpHealthBadge server={s} />
                 <div className="ml-auto flex items-center gap-2" onClick={(e) => e.stopPropagation()}>
                   <Switch
                     checked={s.enabled}
@@ -575,8 +606,13 @@ export default function MCPPage() {
             </CardHeader>
             <CardContent className="grid gap-3">
               <p className="text-muted-foreground text-sm">
-                {s.tools && s.tools.length > 0 ? `${s.tools.length} 个工具` : "尚未发现工具"}
+                {mcpToolCount(s) > 0 ? `${mcpToolCount(s)} 个工具` : "尚未发现工具"}
               </p>
+              {s.enabled && s.last_ok === false && s.last_error ? (
+                <p className="text-destructive line-clamp-2 text-xs break-all" title={s.last_error}>
+                  {s.last_error}
+                </p>
+              ) : null}
               <div className="grid gap-2" onClick={(e) => e.stopPropagation()}>
                 <span className="text-muted-foreground text-xs">可见性（按 Agent 授权）</span>
                 <div className="flex flex-wrap gap-x-4 gap-y-2">
