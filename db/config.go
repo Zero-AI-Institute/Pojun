@@ -70,6 +70,18 @@ type LLMProfile struct {
 	// PresetID 记录该配置来自哪个厂商预设（llmpresets.ID）。仅作展示与向导
 	// 关联用途，不参与 provider 构建；'' = 手动配置或旧数据（v0.4.91 前均有值）。
 	PresetID string `json:"preset_id"`
+	// Prompt 是本配置的独立附加提示词（纯文本）。'' = 未配置。该字段**不在**
+	// profileCols/profileColsKey 中——提示词正文可能很长，故障转移链读取
+	// （PoolProfiles）不该背负它；读写走 ProfilePrompt/ProfilePrompts/SetProfilePrompt。
+	Prompt string `json:"prompt"`
+	// PromptMode 决定附加位置：''（未配置）| prepend | append | replace。
+	PromptMode string `json:"prompt_mode"`
+	// PromptApplyInherited=true 时，本配置作为任务链/全局默认被选中也注入提示词。
+	// false（默认）只认 agents.llm_profile_id 显式绑定；会话 pin 始终视为显式。
+	PromptApplyInherited bool `json:"prompt_apply_inherited"`
+	// EffortOverrides 是只读的反向引用（哪些 Agent 覆盖了本配置的强度），由列表
+	// 处理器一次查询后附加；不在 profileCols 中，也不参与保存。
+	EffortOverrides []AgentEffortRef `json:"-"`
 	// Retry overrides this profile's share of the retry ladder. Zero value =
 	// inherit the global policy (LLMRetryPolicy), so an untouched profile behaves
 	// exactly as before. See RetryOverride.
@@ -140,6 +152,53 @@ func (d *DB) ProfileByID(id int64) (*LLMProfile, error) {
 		return nil, nil
 	}
 	return &p, err
+}
+
+// PromptInfo is a profile-scoped independent prompt. Text "" = not configured.
+type PromptInfo struct {
+	Text           string `json:"prompt"`
+	Mode           string `json:"prompt_mode"`
+	ApplyInherited bool   `json:"prompt_apply_inherited"`
+}
+
+// ProfilePrompt reads one profile's independent prompt. A missing profile yields
+// the zero value. The prompt is intentionally absent from profileCols /
+// profileColsKey so the failover chain never carries the (potentially long) body.
+func (d *DB) ProfilePrompt(id int64) (PromptInfo, error) {
+	var pi PromptInfo
+	err := d.QueryRow(`SELECT COALESCE(prompt,''), COALESCE(prompt_mode,''), COALESCE(prompt_apply_inherited,false) FROM llm_profiles WHERE id=$1`, id).Scan(&pi.Text, &pi.Mode, &pi.ApplyInherited)
+	if err == sql.ErrNoRows {
+		return PromptInfo{}, nil
+	}
+	return pi, err
+}
+
+// ProfilePrompts returns every profile's independent prompt in one query, for the
+// list API to avoid N+1.
+func (d *DB) ProfilePrompts() (map[int64]PromptInfo, error) {
+	rows, err := d.Query(`SELECT id, COALESCE(prompt,''), COALESCE(prompt_mode,''), COALESCE(prompt_apply_inherited,false) FROM llm_profiles`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[int64]PromptInfo{}
+	for rows.Next() {
+		var id int64
+		var pi PromptInfo
+		if err := rows.Scan(&id, &pi.Text, &pi.Mode, &pi.ApplyInherited); err != nil {
+			return nil, err
+		}
+		out[id] = pi
+	}
+	return out, rows.Err()
+}
+
+// SetProfilePrompt writes one profile's independent prompt. Kept separate from
+// SaveProfile so legacy save paths that rebuild a profile from a fixed field list
+// can never blank a user's long prompt.
+func (d *DB) SetProfilePrompt(id int64, text, mode string, applyInherited bool) error {
+	_, err := d.Exec(`UPDATE llm_profiles SET prompt=$1, prompt_mode=$2, prompt_apply_inherited=$3 WHERE id=$4`, text, mode, applyInherited, id)
+	return err
 }
 
 // PoolProfiles returns the failover chain in run order, api keys included: the
@@ -252,10 +311,14 @@ FOR UPDATE OF t`, id)
 	if err != nil {
 		return false, err
 	}
-	lockedAgents, err := lockProfileReferenceRows(ctx, tx, `SELECT id FROM agents
-WHERE llm_profile_id=$1
-ORDER BY id
-FOR UPDATE`, id)
+	lockedAgents, err := lockProfileReferenceRows(ctx, tx, `SELECT a.id FROM agents a
+WHERE a.llm_profile_id=$1
+   OR EXISTS (
+       SELECT 1 FROM agent_profile_effort_overrides o
+       WHERE o.profile_id=$1 AND o.agent_key=a.key
+   )
+ORDER BY a.id
+FOR UPDATE OF a`, id)
 	if err != nil {
 		return false, err
 	}
@@ -298,7 +361,12 @@ WHERE t.llm_profile_id=$1
        WHERE x.task_id=t.id AND x.profile_id=$1
    )
 	UNION ALL
-	SELECT 'agent', a.id FROM agents a WHERE a.llm_profile_id=$1
+	SELECT 'agent', a.id FROM agents a
+WHERE a.llm_profile_id=$1
+   OR EXISTS (
+       SELECT 1 FROM agent_profile_effort_overrides o
+       WHERE o.profile_id=$1 AND o.agent_key=a.key
+   )
 	UNION ALL
 	SELECT 'conversation', c.id FROM conversations c WHERE c.llm_profile_id=$1
 ) refs

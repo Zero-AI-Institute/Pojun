@@ -48,7 +48,13 @@ type Planner struct {
 	noaEnabledFn         func() bool                            // resolver: use experimental noa compaction? (nil = off)
 	maxTokensFn          func() int                             // resolver: per-reply output cap (nil/0 = send no cap)
 	programProfile       *db.ProgramProfile                     // SRC/众测 profile（nil = 不渲染）
+	taskAuthBlock        string                                 // 多角色凭据摘要（#24，无明文）
 	compactor            *Compactor                             // cold-node compaction (§7); nil = disabled
+	// profilePrompt resolves the LLM-profile-scoped overlay for this run (nil =
+	// none). Wired by the task bundle; read once per round, so a task-chain
+	// profile change takes effect on the next run (the system prompt is fixed
+	// for the duration of one run).
+	profilePrompt func() ProfilePrompt
 
 	// todos keeps ONE plan-scratchpad per task (keyed by exploration id) so the
 	// planner's multi-step plan survives across wake-ups — each Plan() is a fresh
@@ -68,8 +74,22 @@ func (p *Planner) SetScopeFlags(scopeGuard, scopeInheritWrites, crossTaskNotifyD
 	p.crossTaskNotifyDedup = crossTaskNotifyDedup
 }
 
+// SetProfilePromptResolver wires the per-run LLM-profile overlay. nil = no
+// overlay. Called once per planning round.
+func (p *Planner) SetProfilePromptResolver(fn func() ProfilePrompt) { p.profilePrompt = fn }
+
+func (p *Planner) promptOverlay() ProfilePrompt {
+	if p.profilePrompt != nil {
+		return p.profilePrompt()
+	}
+	return ProfilePrompt{}
+}
+
 // SetProgramProfile 注入任务级 SRC/众测 profile（v0.4.112）；nil=不渲染、零行为变化。
 func (p *Planner) SetProgramProfile(profile *db.ProgramProfile) { p.programProfile = profile }
+
+// SetTaskAuthBlock 注入多角色凭据摘要（#24）；只含 ID/角色/状态/登录地址，不含秘密。
+func (p *Planner) SetTaskAuthBlock(block string) { p.taskAuthBlock = block }
 
 func (p *Planner) SetCompactionWindowResolver(fn func() int) { p.windowFn = fn }
 
@@ -439,10 +459,17 @@ const plannerDefaultTmpl = `你是一个网络安全平台授权渗透测试系�
 不重复、不硬凑；但目标未达成、又有未覆盖且更深的打法时，该派就派。简洁、聚焦、高效。`
 
 func plannerSystem(goal, dataDir, workDir string) string {
-	body := renderSystem("planner", plannerDefaultTmpl, PlannerVars{Goal: goal, DataDir: dataDir, Now: nowStr()})
-	// 作业硬尾巴（v0.4.63）：漏洞覆盖矩阵/纵深优先 + 授权边界复核。
-	return body + artifactSpec(workDir) + coverageMatrixPlannerGuidance + scopeVerifyPlannerGuidance + execFacePlannerGuidance +
-		engagementFraming + impactOrchestrationGuidance + blackboardPlannerGuidance + untrustedOutputGuidance
+	return plannerSystemWith(goal, dataDir, workDir, ProfilePrompt{})
+}
+
+func plannerSystemWith(goal, dataDir, workDir string, pp ProfilePrompt) string {
+	// Body/profile/skill + the code-owned hard tails come from the shared
+	// assembly (RuntimeSystem), so the read-only chain projection and the runtime
+	// cannot drift.
+	out, _ := RuntimeSystem("planner", plannerDefaultTmpl,
+		PlannerVars{Goal: goal, DataDir: dataDir, Now: nowStr()}, pp,
+		PlannerTailOptions(workDir))
+	return out
 }
 
 // Plan runs one planning round. emit, if non-nil, receives the planner's execution
@@ -519,11 +546,14 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	// （worker 有注入所以从不报错，问题只在规划者/主 Agent 侧复现）。
 	tsx.SetRunDir(taskDir)
 	ctx = intercept.WithReviewContext(ctx, taskDir, intercept.ReviewBackground{})
-	sysBody := plannerSystem(goal, p.workDir, taskDir)
+	sysBody := plannerSystemWith(goal, p.workDir, taskDir, p.promptOverlay())
 	if p.wantConstraints() {
 		sysBody += constraintBlock(ts) // 操作约束(若有)注入系统提示,框定探索边界
 	}
 	sysBody += ProgramProfileBlock(p.programProfile)
+	if p.taskAuthBlock != "" {
+		sysBody += p.taskAuthBlock // 多角色凭据只暴露 ID/角色/健康状态，不含明文
+	}
 	// 自主推进：完成优先（目标未达成不得以「边际收益」收场）。
 	sysBody += autopilotTail(ctx, autopilotPlannerGuidance)
 	// 派发节奏（v0.4.68）：本轮新增上限 + 退役护栏说明。

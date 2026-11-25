@@ -81,27 +81,25 @@ func chatWorkDirSpec(workDir string) string {
 	return "\n\n**文件输出规约**：需要写文件时，一律写到工作目录 " + workDir + "（这是默认 CWD，相对路径即落在这里，也可用该绝对路径）——不要写 /tmp 或其他绝对路径。"
 }
 
-// chatSystem renders the DB-managed prompt body for agentKey. Custom agents have
-// no per-key in-code default, so DefaultAssistantPrompt is the render fallback.
+// chatSystem renders the DB-managed prompt body for agentKey, falling back to
+// the agent's built-in default (DefaultPromptFor), matching the static chain.
 func chatSystem(agentKey, dataDir, workDir string) string {
-	out := renderSystem(agentKey, DefaultAssistantPrompt, chatVars{DataDir: dataDir, Now: nowStr()}) + chatWorkDirSpec(workDir)
-	// 执行/报告类对话 agent 也要看到全量验证口径——它们不走 planner/worker 的
-	// system 装配，只在 chat 路径运行。
-	switch agentKey {
-	case "pentest":
-		out += engagementFraming + impactVerificationGuidance + impactOrchestrationGuidance + srcReportAnnex
-	case "reporter":
-		out += engagementFraming + srcReportAnnex
-	case "retester":
-		out += engagementFraming
-	}
+	return chatSystemWith(agentKey, dataDir, workDir, ProfilePrompt{})
+}
+
+func chatSystemWith(agentKey, dataDir, workDir string, pp ProfilePrompt) string {
+	// 执行/报告类对话 agent 的尾巴（workdir 规约、交战框定、影响验证/编排、SRC
+	// 报告附录）全部由 StaticTailSegments 统一声明，经 RuntimeSystem 与运行时共用，
+	// 避免页面投影与真实装配各写一份。
+	out, _ := RuntimeSystem(agentKey, DefaultPromptFor(agentKey),
+		chatVars{DataDir: dataDir, Now: nowStr()}, pp, ChatTailOptions(workDir))
 	return out
 }
 
 // chatVars carries the runtime variables a custom agent's prompt may reference.
 // DataDir (server data root) + Now (server wall-clock, refreshed each turn) are the
 // universal ones; any other {{.X}} fails to render and falls back to
-// DefaultAssistantPrompt.
+// DefaultPromptFor(agentKey), matching the static chain preview.
 type chatVars struct{ DataDir, Now string }
 
 // Chat runs ONE turn of a conversation with the agent identified by agentKey,
@@ -134,7 +132,7 @@ func (c *ChatAgent) Chat(ctx context.Context, agentKey, sessionID, message strin
 	tools, def, cleanup := AugmentTools(ctx, agentKey, base)
 	defer cleanup()
 
-	system, boundary := deferredSystem(chatSystem(agentKey, c.workDir, sessionWorkDir), def)
+	system, boundary := deferredSystem(chatSystemWith(agentKey, c.workDir, sessionWorkDir, ProfilePromptFrom(ctx)), def)
 	opts := agentcore.Options{
 		Provider:        c.prov,
 		SystemPrompt:    system,

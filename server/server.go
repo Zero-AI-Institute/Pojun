@@ -82,6 +82,9 @@ type Server struct {
 	// scheduler tick and an HTTP settings change / task creation can't both count
 	// free slots off the same snapshot and over-promote past the limit.
 	concMu sync.Mutex
+	// trafficRetentionMu serializes manual/automatic TTL passes. The traffic store
+	// has its own write lock, but status→delete is a read-then-write sequence.
+	trafficRetentionMu sync.Mutex
 
 	cfgMu     sync.Mutex
 	chatAgent *agent.ChatAgent // conversational runner for the chat page; nil w/o LLM
@@ -119,19 +122,23 @@ type Server struct {
 	triggerActive map[string]int
 	triggerCfg    map[string]triggerBehavior
 
-	// profChatAgents caches a per-profile ChatAgent (chat page), keyed by profile id.
-	// Built lazily on first use; invalidated when any profile is saved/activated/deleted
-	// so edits take effect.
+	// profChatAgents caches a per-(agent, profile) ChatAgent (chat page). The agent
+	// key is part of the key because a per-(agent, profile) effort override changes
+	// the provider parameters. Built lazily; invalidated when any profile/effort is
+	// saved or deleted so edits take effect.
 	profMu         sync.Mutex
-	profChatAgents map[int64]*agent.ChatAgent // per-profile ChatAgent cache (chat page)
+	profChatAgents map[chatAgentKey]*agent.ChatAgent // per-(agent, profile) ChatAgent cache
 
-	// provByProfile caches ONE provider per LLM profile id so every agent bound or
-	// pinned to the same profile shares a single provider instance — hence one rate
-	// limiter. applyLLM also resolves the persisted global-active profile through this
-	// cache, so global fallback and task chains do not accidentally double the
-	// configured request rate. Cleared on profile edits, then repopulated by active reapply.
+	// provByProfile caches ONE provider per (LLM profile id, effective reasoning
+	// effort) so every agent resolving to the same pair shares a single provider
+	// instance — hence one rate limiter. The effort is part of the key because a
+	// per-(agent, profile) effort override changes the request parameters; two
+	// agents with different overrides must not share one provider. applyLLM also
+	// resolves the persisted global-active profile through this cache, so global
+	// fallback and task chains do not accidentally double the configured request rate.
+	// Cleared on profile/effort edits, then repopulated by active reapply.
 	provCacheMu   sync.Mutex
-	provByProfile map[int64]*provEntry
+	provByProfile map[provKey]*provEntry
 	provCacheGen  uint64
 
 	// llmHealth is the process-wide circuit-breaker state for LLM failover (轮询).
@@ -159,6 +166,21 @@ type provEntry struct {
 	cfg  agent.Config
 }
 
+// provKey identifies a cached provider: the profile plus the reasoning effort it
+// was built with. The same profile can serve several agents at different efforts
+// when (agent, profile) overrides exist.
+type provKey struct {
+	profileID int64
+	effort    string
+}
+
+// chatAgentKey identifies a cached ChatAgent. The agent key participates because
+// two agents can share a profile but run different effort overrides.
+type chatAgentKey struct {
+	agentKey  string
+	profileID int64
+}
+
 // triggeredRun is one queued P3 trigger fire awaiting its turn for an agent.
 // taskID + mergeable let the drainer coalesce several event triggers (finding/goal)
 // from the SAME task into one conversation before it starts (interval fires don't merge).
@@ -181,8 +203,8 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	s := &Server{m: m, engine: NewEngine(m), ctx: ctx, skillDir: skillDir, keyDir: keyDir, dataDir: dataDir, chatBusy: map[string]bool{},
 		chatCancel: map[string]context.CancelCauseFunc{}, triggerQ: map[string][]triggeredRun{},
 		triggerActive: map[string]int{}, triggerCfg: map[string]triggerBehavior{},
-		profChatAgents: map[int64]*agent.ChatAgent{},
-		provByProfile:  map[int64]*provEntry{}, llmHealth: newLLMHealthRegistry(m.pg),
+		profChatAgents: map[chatAgentKey]*agent.ChatAgent{},
+		provByProfile:  map[provKey]*provEntry{}, llmHealth: newLLMHealthRegistry(m.pg),
 		taskAgents: map[string]*taskAgentBundle{}, archiveWake: make(chan struct{}, 1)}
 	s.jwtKey.Store(key)
 	llmpresets.InitCache(dataDir) // 厂商模型元数据缓存（7 天 TTL，失败静默用内嵌快照）
@@ -292,6 +314,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		// 漏洞 IM 推送投递引擎。与 Scheduler 并列但独立：推送的实时性要求(3s)
 		// 与触发器的业务节奏不同，且两者失败互不牵连——推送卡住不该影响 agent 触发。
 		go newNotifier(s).Run(s.ctx)
+		s.startTrafficRetentionWorker()
 		// Verify every enabled MCP at startup (connection + tools/list), recording
 		// last_ok/last_error/latency for the UI. Async so it never blocks startup.
 		go s.checkMCPHealthOnStartup()
@@ -526,7 +549,7 @@ func (s *Server) applyLLM(cfg agent.Config) error {
 		profName := s.llmProf
 		s.cfgMu.Unlock()
 		prov = llmrec.Wrap(prov, s.m.PG(), cfg.Model, profName, cfg.ThinkingType, cfg.ReasoningEffort, s.m.LLMRecordEnabled)
-		prov = bindSideProvider(prov, cfg, 0, profName)
+		prov = bindSideProvider(prov, cfg, 0, profName, "")
 	}
 	s.cfgMu.Lock()
 	s.llmDirect = prov
@@ -577,6 +600,15 @@ func (s *Server) loadProfileConfig(id int64) (agent.Config, bool) {
 	if err != nil || p == nil {
 		return agent.Config{}, false
 	}
+	return s.profileConfig(p)
+}
+
+// profileConfig is loadProfileConfig's profile-in-hand form, so a caller that
+// already loaded the row (e.g. per-agent effort resolution) does not query twice.
+func (s *Server) profileConfig(p *db.LLMProfile) (agent.Config, bool) {
+	if p == nil {
+		return agent.Config{}, false
+	}
 	cfg := agent.ConfigFrom(p.Format, p.Model, p.BaseURL, p.APIKey, p.Proxy)
 	cfg.RatePerSecond, cfg.RatePerMinute = p.RatePerSecond, p.RatePerMinute
 	cfg.ContextWindowK = p.ContextWindowK
@@ -616,8 +648,19 @@ func (s *Server) effectiveProfileForAgent(agentKey string, pinID *int64) *int64 
 func (s *Server) resolveChatAgent(c *db.Conversation) *agent.ChatAgent {
 	ca := s.chatAgentRef()
 	if eff := s.effectiveProfileForAgent(c.AgentKey, c.LLMProfileID); eff != nil {
-		if pa := s.chatAgentForProfile(*eff); pa != nil {
+		if pa := s.chatAgentForProfile(c.AgentKey, *eff); pa != nil {
 			ca = pa
+		}
+		return ca
+	}
+	// Global fallback: when this agent has an effort override on the globally
+	// active profile, build a per-(agent, profile) chat agent; otherwise the shared
+	// global one is correct.
+	if act, err := s.m.pg.ActiveProfile(); err == nil && act != nil {
+		if _, ok, err := s.m.pg.EffortOverride(c.AgentKey, act.ID); err == nil && ok {
+			if pa := s.chatAgentForProfile(c.AgentKey, act.ID); pa != nil {
+				ca = pa
+			}
 		}
 	}
 	return ca
@@ -638,61 +681,95 @@ func (s *Server) chatUnavailableReason() string {
 	return "LLM 未就绪，无法对话：请检查 系统 → LLM 配置是否有可用且已激活的配置"
 }
 
-// providerForProfile returns a cached provider+cfg for a profile id, so every agent
-// bound/pinned to the same profile shares one provider instance (one rate limiter).
-// ok=false when the profile is missing/invalid → caller falls back to the global pair.
+// providerForProfile returns a cached provider+cfg for a profile id using the
+// profile's own reasoning effort. Used by paths with no agent identity (pin,
+// interception, side questions, compactor) where a per-agent override must not
+// apply. Agent-aware call sites use providerForAgentProfile.
 func (s *Server) providerForProfile(id int64) (llm.Provider, agent.Config, bool) {
+	if s == nil || s.m == nil || s.m.pg == nil {
+		return nil, agent.Config{}, false
+	}
+	p, err := s.m.pg.ProfileByID(id)
+	if err != nil || p == nil {
+		return nil, agent.Config{}, false
+	}
+	return s.providerForProfileEffort(p, p.ReasoningEffort, "")
+}
+
+// providerForAgentProfile resolves the effort this agent should use on this
+// profile (override → profile → unset) and returns the matching cached provider.
+// The override is resolved per call so a failover to another profile re-resolves
+// against the target profile instead of carrying the previous one's value.
+func (s *Server) providerForAgentProfile(agentKey string, id int64) (llm.Provider, agent.Config, bool) {
+	if s == nil || s.m == nil || s.m.pg == nil {
+		return nil, agent.Config{}, false
+	}
+	p, err := s.m.pg.ProfileByID(id)
+	if err != nil || p == nil {
+		return nil, agent.Config{}, false
+	}
+	effort, _ := s.resolveEffort(agentKey, p)
+	return s.providerForProfileEffort(p, effort, agentKey)
+}
+
+// providerForProfileEffort builds (or reuses) one provider for an exact
+// (profile, effective effort) pair. Sharing is keyed on the pair, so agents with
+// identical effective effort still share one rate limiter.
+func (s *Server) providerForProfileEffort(p *db.LLMProfile, effort, agentKey string) (llm.Provider, agent.Config, bool) {
+	key := provKey{profileID: p.ID, effort: effort}
 	s.provCacheMu.Lock()
-	if e := s.provByProfile[id]; e != nil {
+	if e := s.provByProfile[key]; e != nil {
 		s.provCacheMu.Unlock()
 		return e.prov, e.cfg, true
 	}
 	generation := s.provCacheGen
 	s.provCacheMu.Unlock()
-	cfg, ok := s.loadProfileConfig(id)
+	cfg, ok := s.profileConfig(p)
 	if !ok {
 		return nil, agent.Config{}, false
 	}
+	cfg = applyEffortToConfig(cfg, effort)
 	prov, err := cfg.NewProvider()
 	if err != nil {
-		log.Printf("[engine] build provider for LLM profile %d failed: %v", id, err)
+		log.Printf("[engine] build provider for LLM profile %d failed: %v", p.ID, err)
 		return nil, agent.Config{}, false
 	}
-	// Wrap with recorder, tagged with this profile's name.
-	if p, _ := s.m.pg.ProfileByID(id); p != nil {
-		prov = llmrec.Wrap(prov, s.m.PG(), cfg.Model, p.Name, cfg.ThinkingType, cfg.ReasoningEffort, s.m.LLMRecordEnabled)
-		prov = bindSideProvider(prov, cfg, id, p.Name)
-	}
+	// Wrap with recorder, tagged with the effective effort so the LLM record shows
+	// what was actually sent (the profile value or an agent override).
+	prov = llmrec.Wrap(prov, s.m.PG(), cfg.Model, p.Name, cfg.ThinkingType, cfg.ReasoningEffort, s.m.LLMRecordEnabled)
+	prov = bindSideProvider(prov, cfg, p.ID, p.Name, agentKey)
 	s.provCacheMu.Lock()
 	if generation != s.provCacheGen {
 		s.provCacheMu.Unlock()
-		return s.providerForProfile(id)
+		return s.providerForProfileEffort(p, effort, agentKey)
 	}
-	if e := s.provByProfile[id]; e != nil { // lost the race → keep the winner
+	if e := s.provByProfile[key]; e != nil { // lost the race → keep the winner
 		prov, cfg = e.prov, e.cfg
 	} else {
-		s.provByProfile[id] = &provEntry{prov: prov, cfg: cfg}
-		log.Printf("[engine] built provider for LLM profile %d (%s / %s)", id, cfg.Provider(), cfg.Model)
+		s.provByProfile[key] = &provEntry{prov: prov, cfg: cfg}
+		log.Printf("[engine] built provider for LLM profile %d (%s / %s, effort=%q)", p.ID, cfg.Provider(), cfg.Model, cfg.ReasoningEffort)
 	}
 	s.provCacheMu.Unlock()
 	return prov, cfg, true
 }
 
-// chatAgentForProfile returns a ChatAgent built from a specific LLM profile, cached
-// per profile id. Returns nil if the profile is missing or has no API key.
-func (s *Server) chatAgentForProfile(id int64) *agent.ChatAgent {
+// chatAgentForProfile returns a ChatAgent built for one (agent, LLM profile)
+// pair, cached under that pair. Returns nil if the profile is missing or has no
+// API key.
+func (s *Server) chatAgentForProfile(agentKey string, id int64) *agent.ChatAgent {
+	key := chatAgentKey{agentKey: agentKey, profileID: id}
 	s.profMu.Lock()
-	cached := s.profChatAgents[id]
+	cached := s.profChatAgents[key]
 	s.profMu.Unlock()
 	if cached != nil {
 		return cached
 	}
-	prov, cfg, ok := s.providerForProfile(id)
+	prov, cfg, ok := s.providerForAgentProfile(agentKey, id)
 	if !ok {
 		return nil
 	}
 	tx := transcript.NewStore(filepath.Join(s.m.dir, "transcripts"))
-	ca := agent.NewChatAgent(s.poolForBinding(id, prov, cfg), cfg.Model, s.m.dir, tx, cfg.CompactionWindow())
+	ca := agent.NewChatAgent(s.poolForBinding(agentKey, id, prov, cfg), cfg.Model, s.m.dir, tx, cfg.CompactionWindow())
 	ca.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
 	ca.SetWebSearch(s.m.WebSearchOpts())
 	ca.SetGuard(s.chatGuard())
@@ -700,10 +777,10 @@ func (s *Server) chatAgentForProfile(id int64) *agent.ChatAgent {
 	ca.SetMaxTokens(maxTokensResolver(cfg))
 	ca.SetNoaEnabled(s.m.NoaCompactionEnabled) // 实验功能:noa 上下文压缩(每 run 读)
 	s.profMu.Lock()
-	if ex := s.profChatAgents[id]; ex != nil { // lost the race → keep the winner
+	if ex := s.profChatAgents[key]; ex != nil { // lost the race → keep the winner
 		ca = ex
 	} else {
-		s.profChatAgents[id] = ca
+		s.profChatAgents[key] = ca
 	}
 	s.profMu.Unlock()
 	return ca
@@ -714,11 +791,11 @@ func (s *Server) chatAgentForProfile(id int64) *agent.ChatAgent {
 // (and re-resolves each agent's bound model) on their next round.
 func (s *Server) invalidateProfileAgents() {
 	s.profMu.Lock()
-	s.profChatAgents = map[int64]*agent.ChatAgent{}
+	s.profChatAgents = map[chatAgentKey]*agent.ChatAgent{}
 	s.profMu.Unlock()
 	s.provCacheMu.Lock()
 	s.provCacheGen++
-	s.provByProfile = map[int64]*provEntry{}
+	s.provByProfile = map[provKey]*provEntry{}
 	s.provCacheMu.Unlock()
 	s.invalidateTaskAgents()
 }
@@ -874,6 +951,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/tokens/usage", s.pgUsageStats)            // 全局 llm_usage 聚合（仪表盘新版视图）
 	mux.HandleFunc("GET /api/tokens/cost", s.pgUsageCost)              // 成本估算（内置参考价，?task= 看单任务）
 	mux.HandleFunc("POST /api/tasks/{id}/auth-check", s.taskAuthCheck) // 登录凭据自检（真实发一次登录请求）
+	// 任务级多角色凭据池（#24）：秘密只进 DB；列表只回 has_* 标记。
+	mux.HandleFunc("GET /api/tasks/{id}/credentials", s.pgTaskCredentials)
+	mux.HandleFunc("POST /api/tasks/{id}/credentials", s.pgCreateTaskCredential)
+	mux.HandleFunc("PUT /api/tasks/{id}/credentials/{cid}", s.pgUpdateTaskCredential)
+	mux.HandleFunc("DELETE /api/tasks/{id}/credentials/{cid}", s.pgDeleteTaskCredential)
+	mux.HandleFunc("POST /api/tasks/{id}/credentials/{cid}/check", s.pgCheckTaskCredential)
 	// 证据附件（v0.5.0）：列表 / 单文件下载 / 证据包 zip。
 	mux.HandleFunc("GET /api/tasks/{id}/artifacts", s.listTaskArtifacts)
 	mux.HandleFunc("PATCH /api/tasks/{id}/artifacts/{aid}", s.patchTaskArtifact)    // 改归属（任务级 ↔ 漏洞）
@@ -893,6 +976,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/traffic", s.deleteTraffic)
 	mux.HandleFunc("DELETE /api/traffic/hosts", s.deleteTrafficHosts)
 	mux.HandleFunc("DELETE /api/traffic/all", s.deleteAllTraffic)
+	mux.HandleFunc("GET /api/traffic/retention", s.getTrafficRetention)
+	mux.HandleFunc("POST /api/traffic/retention", s.runTrafficRetentionHandler)
 	mux.HandleFunc("GET /api/traffic/exchange", s.getTrafficExchange)
 	mux.HandleFunc("GET /api/traffic/blob", s.getTrafficBlob)
 	mux.HandleFunc("GET /api/commands", s.pgListCommands)
@@ -1000,6 +1085,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/agents/{key}/prompts", s.pgListPromptVersions)
 	mux.HandleFunc("GET /api/agents/{key}/variables", s.pgPromptVars)
 	mux.HandleFunc("POST /api/agents/{key}/prompt/preview", s.pgPreviewPrompt)
+	mux.HandleFunc("GET /api/agents/{key}/prompt/chain", s.pgAgentPromptChain)
+	mux.HandleFunc("GET /api/agents/{key}/llm-effort-overrides", s.pgAgentEffortOverrides)
+	mux.HandleFunc("PUT /api/agents/{key}/llm-effort-overrides/{profile_id}", s.pgSaveAgentEffortOverride)
+	mux.HandleFunc("DELETE /api/agents/{key}/llm-effort-overrides/{profile_id}", s.pgDeleteAgentEffortOverride)
+	mux.HandleFunc("GET /api/agents/{key}/llm-route", s.pgAgentLLMRoute)
 	mux.HandleFunc("GET /api/agents/{key}/visibility", s.pgGetAgentVisibility)
 	mux.HandleFunc("PUT /api/agents/{key}/visibility", s.pgSetAgentVisibility)
 	// 内置工具目录（描述/参数默认值可改、按 agent 绑定；key 与 handler 在代码层）
@@ -3629,20 +3719,21 @@ func (s *Server) settingsPayload() map[string]any {
 	ib := intentBudgetFromPG(s.m.pg)
 	tb := taskBudgetFromPG(s.m.pg)
 	return map[string]any{
-		"traffic_capture":       s.m.TrafficEnabled(),
-		"agent_traffic_binding": s.m.pg.GetBool(settingAgentTrafficBinding, false),
-		"llm_record":            s.m.LLMRecordEnabled(),
-		"web_search_enabled":    on,
-		"web_search_backend":    backend,
-		"brave_key_set":         strings.TrimSpace(braveKey) != "",
-		"tavily_key_set":        strings.TrimSpace(tavilyKey) != "",
-		"web_search_proxy":      proxy,                                                     // 独立出口代理(http/https/socks5)，空=直连
-		"global_proxy":          s.m.GlobalProxy(),                                         // 全局出口代理(http/https/socks5)，所有目标流量走它，空=直连
-		"artifact_max_count":    func() int { c, _ := s.m.pg.ArtifactQuota(); return c }(), // #45/#50 证据附件限额（生效值）
-		"artifact_max_bytes":    func() int64 { _, b := s.m.pg.ArtifactQuota(); return b }(),
-		"install_proxy":         s.installProxy(),            // 装机代理：用于宿主工具安装和程序更新等维护请求
-		"python_interpreter":    strings.TrimSpace(pyStored), // 用户/自动设的值(空=用运行时检测)
-		"workers":               s.m.Workers(),               // 并发工作 agent 数(默认3)；对之后启动的任务生效
+		"traffic_capture":        s.m.TrafficEnabled(),
+		"traffic_retention_days": s.trafficRetentionDays(),
+		"agent_traffic_binding":  s.m.pg.GetBool(settingAgentTrafficBinding, false),
+		"llm_record":             s.m.LLMRecordEnabled(),
+		"web_search_enabled":     on,
+		"web_search_backend":     backend,
+		"brave_key_set":          strings.TrimSpace(braveKey) != "",
+		"tavily_key_set":         strings.TrimSpace(tavilyKey) != "",
+		"web_search_proxy":       proxy,                                                     // 独立出口代理(http/https/socks5)，空=直连
+		"global_proxy":           s.m.GlobalProxy(),                                         // 全局出口代理(http/https/socks5)，所有目标流量走它，空=直连
+		"artifact_max_count":     func() int { c, _ := s.m.pg.ArtifactQuota(); return c }(), // #45/#50 证据附件限额（生效值）
+		"artifact_max_bytes":     func() int64 { _, b := s.m.pg.ArtifactQuota(); return b }(),
+		"install_proxy":          s.installProxy(),            // 装机代理：用于宿主工具安装和程序更新等维护请求
+		"python_interpreter":     strings.TrimSpace(pyStored), // 用户/自动设的值(空=用运行时检测)
+		"workers":                s.m.Workers(),               // 并发工作 agent 数(默认3)；对之后启动的任务生效
 		// 冷节点压缩的输出预算与墙钟上限。0 = 用默认值(32768 token / 20 分钟)。
 		"compaction_max_tokens":      s.m.CompactionTokens(),
 		"compaction_timeout_seconds": s.m.CompactionTimeout(),
@@ -3741,9 +3832,10 @@ func (s *Server) pgDetectPython(w http.ResponseWriter, r *http.Request) {
 // off, agents get no proxy config, no traffic tools, and no proxy prompt content.
 func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		TrafficCapture      *bool `json:"traffic_capture"`
-		AgentTrafficBinding *bool `json:"agent_traffic_binding"`
-		LLMRecord           *bool `json:"llm_record"` // LLM 录制开关（默认关）；即时生效，无需重建 agent
+		TrafficCapture       *bool `json:"traffic_capture"`
+		TrafficRetentionDays *int  `json:"traffic_retention_days"`
+		AgentTrafficBinding  *bool `json:"agent_traffic_binding"`
+		LLMRecord            *bool `json:"llm_record"` // LLM 录制开关（默认关）；即时生效，无需重建 agent
 		// Web search. WebSearchEnabled/Backend toggle the tool + backend; BraveKey/TavilyKey
 		// are optional — omit (null) to leave a stored key untouched, send "" to clear.
 		WebSearchEnabled *bool   `json:"web_search_enabled"`
@@ -4241,6 +4333,17 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		changed = true
+	}
+	if req.TrafficRetentionDays != nil {
+		days := *req.TrafficRetentionDays
+		if days < 0 || days > maxTrafficRetentionDays {
+			writeErr(w, 400, fmt.Sprintf("traffic_retention_days 必须在 0-%d 之间", maxTrafficRetentionDays))
+			return
+		}
+		if err := s.m.pg.SetSetting(settingTrafficRetentionDays, strconv.Itoa(days)); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
 	}
 	if req.GlobalProxy != nil {
 		// Validation failure (bad scheme/host) is a client error, not a 500.

@@ -491,6 +491,29 @@ ALTER TABLE llm_profiles ADD  CONSTRAINT llm_profiles_retry_check CHECK (
 -- 预设。仅展示/向导关联用途，不参与 provider 构建；'' = 手动配置或旧数据。
 ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS preset_id TEXT NOT NULL DEFAULT '';
 
+-- LLM 配置级独立提示词（v0.4.121）：本配置被 Agent 显式绑定（或开启「继承时
+-- 也生效」后实际被选中）时，作为一段纯文本附加到该 Agent 的 system prompt。
+-- '' = 未配置，历史行为逐字节不变。纯文本：不做 Go 模板渲染，{{.Var}} 原样保留。
+ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS prompt TEXT NOT NULL DEFAULT '';
+-- 装配位置：'' = 未配置（必须与 prompt='' 同时出现）；prepend/append/replace 三选。
+--   prepend = 正文最前；append = 正文+技能索引之后、代码硬尾巴之前；replace = 替换正文
+--   （技能索引与代码硬尾巴仍保留）。
+ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS prompt_mode TEXT NOT NULL DEFAULT '';
+-- 继承时也生效：false（默认）= 仅当本配置被 agents.llm_profile_id 显式绑定时注入；
+-- true = 当本配置作为任务链/全局默认被实际选中时也注入（会话 pin 始终视为显式）。
+ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS prompt_apply_inherited BOOLEAN NOT NULL DEFAULT false;
+-- 同 format：先删再建，保证每次启动幂等。
+ALTER TABLE llm_profiles DROP CONSTRAINT IF EXISTS llm_profiles_prompt_mode_check;
+ALTER TABLE llm_profiles ADD  CONSTRAINT llm_profiles_prompt_mode_check
+    CHECK (prompt_mode IN ('','prepend','append','replace'));
+ALTER TABLE llm_profiles DROP CONSTRAINT IF EXISTS llm_profiles_prompt_len_check;
+ALTER TABLE llm_profiles ADD  CONSTRAINT llm_profiles_prompt_len_check
+    CHECK (char_length(prompt) <= 8000);
+-- 二值等价：有正文必有模式，无正文必无模式，杜绝「存了字却不生效」的死状态。
+ALTER TABLE llm_profiles DROP CONSTRAINT IF EXISTS llm_profiles_prompt_pair_check;
+ALTER TABLE llm_profiles ADD  CONSTRAINT llm_profiles_prompt_pair_check
+    CHECK ((prompt = '') = (prompt_mode = ''));
+
 -- 资产 URL 结构指纹（v0.4.94 经验层）：64-bit simhash（路径段归一+参数名+title/长度
 -- 分桶），同 root_domain 下汉明距离近的 endpoint 归同簇，供变体分析找同类端点。
 ALTER TABLE assets ADD COLUMN IF NOT EXISTS simhash BIGINT NOT NULL DEFAULT 0;
@@ -620,6 +643,28 @@ ALTER TABLE tasks ADD COLUMN IF NOT EXISTS queued_at TIMESTAMPTZ;
 -- 任务级目标登录凭据（v0.4.8）：worker 先登录再测；password/totp_secret 只在
 -- DB 内保存，任何 API 响应都脱敏（见 db/task_auth.go）。NULL=未配置。
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS auth_config JSONB;
+
+-- 任务级多角色测试凭据池（#24）：每个任务可配置 admin/user_a/user_b 等命名凭据。
+-- config 复用 TaskAuthConfig 的 DBValue 形态（含秘密；API DTO 只回 has_* 标记）。
+-- status: pending | ok | failed | locked；secret_hash 用于凭据变更后自动复位熔断。
+CREATE TABLE IF NOT EXISTS task_credentials (
+    id             BIGSERIAL PRIMARY KEY,
+    task_id        BIGINT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    role           TEXT NOT NULL,
+    config         JSONB NOT NULL DEFAULT '{}',
+    status         TEXT NOT NULL DEFAULT 'pending',
+    last_checked_at TIMESTAMPTZ,
+    last_error     TEXT NOT NULL DEFAULT '',
+    failure_count  INT NOT NULL DEFAULT 0,
+    locked_until   TIMESTAMPTZ,
+    secret_hash    TEXT NOT NULL DEFAULT '',
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT ck_task_credential_role CHECK (role ~ '^[A-Za-z][A-Za-z0-9_-]{0,31}$'),
+    CONSTRAINT ck_task_credential_status CHECK (status IN ('pending','ok','failed','locked')),
+    CONSTRAINT uq_task_credential_role UNIQUE (task_id, role)
+);
+CREATE INDEX IF NOT EXISTS idx_task_credentials_task ON task_credentials(task_id);
 -- 任务构建时出口回执（issue #39）：最近一次 Agent 装配时实际注入的出口配置快照。
 -- 写入端已完成脱敏（不含代理用户名/密码），只读派生数据；NULL=尚未构建或归档已作废。
 -- 刻意不进 taskCols/scanTask：任务列表热路径不需要解析它，读取走窄查询。
@@ -1717,3 +1762,31 @@ CREATE TABLE IF NOT EXISTS credential_access_log (
     at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_credential_audit ON credential_access_log(credential_id, at DESC);
+
+-- LLM 选路转跳审计（llm_switch / llm_failover）按任务取历史时走偏索引：
+-- activity 上没有 kind 过滤，跨任务汇总在大会话上会退化为全表扫描。
+CREATE INDEX IF NOT EXISTS idx_act_llm_kind ON activity(exploration_id, id)
+    WHERE kind IN ('llm_switch','llm_failover');
+
+-- ============================================================================
+-- Agent × LLM 配置的 reasoning effort 覆盖（v0.4.121）
+-- effort 原本只属于 llm_profiles.reasoning_effort：同一个 Agent 想换个强度就得
+-- 复制整份配置。本表把「强度」从「配置」里解耦，(agent_key, profile_id) 命中时
+-- 优先于该配置自身的 reasoning_effort；空值不落库（清除覆盖 = 删除该行）。
+-- 只影响请求参数，不改变模型选择、故障转移与配额；故障转移到另一配置时按
+-- (该 Agent, 目标配置) 重新解析，不沿用上一配置的覆盖。
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS agent_profile_effort_overrides (
+    agent_key        TEXT NOT NULL REFERENCES agents(key) ON DELETE CASCADE,
+    profile_id       BIGINT NOT NULL REFERENCES llm_profiles(id) ON DELETE CASCADE,
+    reasoning_effort TEXT NOT NULL,
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (agent_key, profile_id)
+);
+CREATE INDEX IF NOT EXISTS idx_apeo_profile ON agent_profile_effort_overrides(profile_id);
+-- 只接受运行时认识的五个档位；空值不落库（清除覆盖 = 删除该行）。
+ALTER TABLE agent_profile_effort_overrides
+    DROP CONSTRAINT IF EXISTS agent_profile_effort_overrides_effort_check;
+ALTER TABLE agent_profile_effort_overrides
+    ADD CONSTRAINT agent_profile_effort_overrides_effort_check
+    CHECK (reasoning_effort IN ('low','medium','high','xhigh','max'));

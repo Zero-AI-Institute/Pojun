@@ -1835,6 +1835,26 @@ func (s *Server) pgListProfiles(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
+	// Prompt bodies are fetched in one query and attached to the DTO; they are
+	// deliberately absent from profileCols so the failover chain stays lean. A
+	// failed read is fatal: returning profiles with blank prompts would let the
+	// editor save an explicit empty prompt and silently wipe long text.
+	prompts, err := pg.ProfilePrompts()
+	if err != nil {
+		writeErr(w, 500, "读取独立提示词失败")
+		return
+	}
+	for _, p := range ps {
+		if pi, ok := prompts[p.ID]; ok {
+			p.Prompt, p.PromptMode, p.PromptApplyInherited = pi.Text, pi.Mode, pi.ApplyInherited
+		}
+	}
+	// 反向引用：哪些 Agent 覆盖了本配置的强度。读取失败不阻断列表（这是辅助信息）。
+	if ovs, err := pg.AllEffortOverrides(); err == nil {
+		for _, p := range ps {
+			p.EffortOverrides = ovs[p.ID]
+		}
+	}
 	writeJSON(w, 200, map[string]any{"profiles": llmProfileDTOs(ps)})
 }
 
@@ -1852,6 +1872,11 @@ func (s *Server) pgSaveProfile(w http.ResponseWriter, r *http.Request) {
 		db.LLMProfile
 		APIKey    string `json:"api_key"`
 		Streaming *bool  `json:"streaming"`
+		// 独立提示词三态影子指针：缺省=保留原值；""=清空；文本=写入。
+		// 沿用 Streaming *bool 的先例，避免旧客户端/旧 web bundle 一保存就清空长文。
+		Prompt               *string `json:"prompt"`
+		PromptMode           *string `json:"prompt_mode"`
+		PromptApplyInherited *bool   `json:"prompt_apply_inherited"`
 	}
 	if err := decode(r, &body); err != nil {
 		writeErr(w, 400, err.Error())
@@ -1883,8 +1908,28 @@ func (s *Server) pgSaveProfile(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "user_agent 不能包含换行")
 		return
 	}
+	// 独立提示词：读旧值回填三态，再做纯文本归一与长度/枚举校验。读取失败必须
+	// 拒绝保存，否则会以零值回填并静默清空用户长文。
+	oldPrompt := db.PromptInfo{}
+	if p.ID != 0 {
+		var err error
+		oldPrompt, err = pg.ProfilePrompt(p.ID)
+		if err != nil {
+			writeErr(w, 500, "读取原有独立提示词失败，已拒绝保存以免清空")
+			return
+		}
+	}
+	prompt, promptErr := normalizeProfilePromptRequest(oldPrompt, body.Prompt, body.PromptMode, body.PromptApplyInherited)
+	if promptErr != "" {
+		writeErr(w, 400, promptErr)
+		return
+	}
 	id, err := pg.SaveProfile(&p)
 	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	if err := pg.SetProfilePrompt(id, prompt.Text, prompt.Mode, prompt.ApplyInherited); err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}

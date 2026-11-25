@@ -18,7 +18,6 @@ import (
 	actool "github.com/Autumn-27/norma/tool"
 	"github.com/Autumn-27/norma/transcript"
 	"github.com/chu0119/pojun/db"
-	"github.com/chu0119/pojun/hosttools"
 	"github.com/chu0119/pojun/intercept"
 	"github.com/chu0119/pojun/telemetry"
 	"go.opentelemetry.io/otel/attribute"
@@ -83,6 +82,8 @@ type Worker struct {
 	// taskAuthBlock 是任务级登录凭据的渲染块（v0.4.8，由 host 在装配时设置）。
 	// 非空则注入 system prompt：worker 先登录、再在会话内测试。
 	taskAuthBlock string
+	// taskCredResolver 解析任务级命名凭据池（#24）；nil=仅支持旧单账号/资产凭据。
+	taskCredResolver TaskCredentialResolver
 	// injectConstraints resolves whether this task's operation constraints get
 	// injected into the worker system prompt. Read per run so the settings toggle
 	// takes effect without rebuilding the agent. nil = inject (default).
@@ -100,6 +101,9 @@ type Worker struct {
 	maxTokensFn func() int
 	// programProfile 是任务级 SRC/众测 profile（v0.4.112）；nil=不渲染，零行为变化。
 	programProfile *db.ProgramProfile
+	// profilePrompt resolves the LLM-profile-scoped overlay for this run (nil =
+	// none). Wired by the task bundle; read per run.
+	profilePrompt func() ProfilePrompt
 }
 
 // WorkerSessionID returns the stable transcript key used by a worker intent.
@@ -165,6 +169,9 @@ func (w *Worker) SetRunTimeout(run time.Duration) {
 
 // SetTaskAuthBlock 设置任务级登录凭据渲染块（host 装配时调用；空串=不注入）。
 func (w *Worker) SetTaskAuthBlock(block string) { w.taskAuthBlock = block }
+
+// SetTaskCredentialResolver 注入任务级多角色凭据解析器（#24）。
+func (w *Worker) SetTaskCredentialResolver(r TaskCredentialResolver) { w.taskCredResolver = r }
 
 // SetArtifactRecorder 注入证据附件存储（host 实现）。
 func (w *Worker) SetArtifactRecorder(r ArtifactRecorder) { w.artifactRecorder = r }
@@ -395,19 +402,19 @@ func workerEgressBlock(proxyAddr string) string {
 }
 
 func workerSystem(proxyAddr, caCert, dataDir, runDir string) string {
-	body := renderSystem("worker", workerDefaultTmpl, WorkerVars{ProxyAddr: proxyAddr, DataDir: dataDir, Now: nowStr()})
+	return workerSystemWith(proxyAddr, caCert, dataDir, runDir, ProfilePrompt{})
+}
+
+func workerSystemWith(proxyAddr, caCert, dataDir, runDir string, pp ProfilePrompt) string {
 	// caCert is present only when the recording MITM is on, which is exactly when
 	// the traffic_* tools are registered — so it gates the traffic-tool note.
 	// Optional finding guidance is added for every role after tool resolution.
-	// 作业硬尾巴（v0.4.63）：扫描器优先 + 技能路由，代码注入不可经 UI 改掉。
-	out := body + workerTrafficBlock(caCert != "") + workerEgressBlock(proxyAddr) + workerArtifactSpec(runDir) + scannerFirstGuidance + skillRoutingGuidance + execFaceWorkerGuidance +
-		engagementFraming + impactVerificationGuidance + untrustedOutputGuidance
-	// 宿主工具清单：真正动手的是 worker，所以清单必须进 worker 的 system prompt。
-	// 之前只有 planner 的唤醒提示里有（用于「派意图选手段」），worker 看不到——
-	// 于是新装的一批工具（dalfox/feroxbuster/chisel…）一次都没被用起来。
-	if t := hosttools.SummaryText(); t != "" {
-		out += "\n\n【本机可用工具】\n" + t
-	}
+	// All tails (traffic/egress/artifact/scanner/skill routing/exec face/engagement/
+	// impact/untrusted/host tools) are code-owned and shared with the read-only
+	// chain projection via RuntimeSystem.
+	out, _ := RuntimeSystem("worker", workerDefaultTmpl,
+		WorkerVars{ProxyAddr: proxyAddr, DataDir: dataDir, Now: nowStr()}, pp,
+		WorkerTailOptions(proxyAddr, caCert, runDir))
 	return out
 }
 
@@ -585,6 +592,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	defer span.End()
 	tsx := NewToolSet(ts, name)
 	tsx.SetEgressProxy(w.proxyAddr, w.proxyCACert) // 原生 http_request/session_login 与 Bash 同源出口
+	tsx.SetTaskCredentialResolver(w.taskCredResolver)
 	tsx.SetScopeFlags(w.scopeGuard, w.scopeInheritWrites, w.crossTaskNotifyDedup)
 	tsx.SetFindingRecorder(w.findingRecorder)
 	tsx.SetTaskID(taskID)
@@ -626,7 +634,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// 血缘、意图 token 台账、coverage、related_tasks 等）不进 worker 视图，省掉每次
 	// 启动的重建计算与注入前缀。worker 只需要「别人发现了什么」做去重与联想。
 	overview := renderWorkerGraphOverview(tsx.workerOverviewData())
-	sysBody := workerSystem(w.proxyAddr, w.proxyCACert, w.workDir, runDir)
+	sysBody := workerSystemWith(w.proxyAddr, w.proxyCACert, w.workDir, runDir, w.promptOverlay())
 	if w.wantConstraints() {
 		sysBody += constraintBlock(ts) // 操作约束(若有)注入系统提示,worker 执行时严格遵守
 	}
@@ -881,3 +889,14 @@ func (w *Worker) SetScopeFlags(scopeGuard, scopeInheritWrites, crossTaskNotifyDe
 
 // SetProgramProfile 注入任务级 SRC/众测 profile（v0.4.112）；nil=不渲染。
 func (w *Worker) SetProgramProfile(profile *db.ProgramProfile) { w.programProfile = profile }
+
+// SetProfilePromptResolver wires the per-run LLM-profile overlay. nil = no
+// overlay. Called once per run.
+func (w *Worker) SetProfilePromptResolver(fn func() ProfilePrompt) { w.profilePrompt = fn }
+
+func (w *Worker) promptOverlay() ProfilePrompt {
+	if w.profilePrompt != nil {
+		return w.profilePrompt()
+	}
+	return ProfilePrompt{}
+}

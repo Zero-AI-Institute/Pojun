@@ -2,6 +2,118 @@
 
 本项目的重要变更记录在此文件中，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [0.4.121] - 2026-11-25
+### 新增：LLM 配置独立提示词与 Agent 装配链只读视图
+
+- **独立提示词**：`llm_profiles` 新增 `prompt` / `prompt_mode` /
+  `prompt_apply_inherited`（幂等迁移，默认空/关闭）。支持 `prepend`（正文最前）、
+  `append`（正文与技能索引之后、代码硬尾巴之前）、`replace`（替换正文，保留技能索引与
+  代码硬尾巴）三种位置；纯文本，不做模板变量渲染；上限 8000 字符。
+- **生效规则**：Agent 显式绑定与会话 pin 始终生效；任务链/全局配置仅在该配置
+  勾选“继承时也生效”（`prompt_apply_inherited`）时生效。未配置时提示词逐字节不变。
+- **装配链 API**：`GET /api/agents/{key}/prompt/chain`（可选 `profile_id` 预览）返回
+  当前 LLM 解析、各段来源/可编辑/门控/字符数、代码尾段、运行时段注入点，以及
+  工具/MCP/Skill 静态清单。只读：不建 provider、不连接 MCP、不返回凭据。
+- **前端**：装配链改为独立的「全链路」页（独立路由，可从 Agent 页头部、Agent 卡片与
+  编辑器头部进入），页面内可切换查看任意 Agent，并提供跳转到该 Agent 配置页的入口。
+  视图采用门控信号流（Gate Flow）只读渲染：纵向主干 + 工位行，左侧 LLM 解析梯与 Skill 轨，
+  右侧 Tools/MCP 轨；行状态用实线/门控虚线/运行时点线区分，代码尾段前画 TERMINAL
+  硬边界，排除项常驻隔离架；顶部态势带显示 PROFILE/OVERLAY/SCALE/INTEGRITY/RUNTIME
+  与指示灯（`LAMP TEST` 一次性自检，缺失写“未采集”）。LLM 配置抽屉新增可折叠的独立
+  提示词编辑区（位置三选、继承开关、字符/token 估算、绑定 Agent 反查）；配置列表显示
+  “独立提示词”徽章。
+- **测试**：装配顺序（三模式 + 代码尾段 + 技能索引）、未配置逐字节不变、静态尾段与
+  运行时一致（运行时装配与链路投影共用同一装配入口，避免两份实现漂移）、数据库幂等迁移/约束/往返、
+  保存三态与继承解析、链 API 处理器；新增服务端「链路投影 == 真实装配」一致性测试
+  （planner/worker/mainagent/pentest × prepend/append/replace）与覆盖来源边界测试
+  （Agent 绑定 / 任务链 / 会话 pin / 全局配置）。
+
+### 新增：思考强度与 LLM 配置解耦
+
+- **数据层**：新表 `agent_profile_effort_overrides(agent_key, profile_id, reasoning_effort)`
+  （幂等迁移，双 FK 级联，CHECK 限定枚举）。可给某个 Agent 在某份 LLM 配置上单独指定
+  强度，无需复制配置；配置的 `reasoning_effort` 仍是其自身默认值。
+- **解析**：`override → profile → 未设置`，运行时 provider、装配链投影、路由视图与审计
+  共用同一纯函数；空 agent key（pin/judge/环境变量）不读覆盖；越界值视为未设置。
+  无覆盖时与直接使用该配置逐字段一致，并共享同一个 provider 缓存实例（同一限流器）。
+- **生效语义**：下一次模型调用生效，不重建运行中的 system prompt；failover 按目标配置
+  重新解析，不继承来源值；thinking 降级状态在配置切换时重置。
+- **API/UI**：`GET|PUT|DELETE /api/agents/{key}/llm-effort-overrides[/{profile_id}]`
+  （GET 回显全部配置与生效来源，PUT 空串等同清除，成功 204，DELETE 幂等）；Agent 编辑器
+  新增覆盖区块（默认只列绑定/全局激活/已有覆盖，可展开全部）；LLM 配置抽屉新增反向列表
+  「被以下 Agent 覆盖」。
+- **审计**：`llm_switch` / `llm_failover` 的 before/after 快照带 effort 与来源。
+
+### 新增：LLM 路由与回退链只读可视化
+
+- `GET /api/agents/{key}/llm-route`：五层来源优先级、各角色解析、任务配置链（游标/状态/
+  最后一次错误）、provider 池（包裹关系、健康度、是否在链上、是否有 key）、额度转跳
+  规则、运行期转跳历史（`task_id` 精确 / 跨任务近似；`limit` 为事件条数，默认 50、上限
+  200）与最近任务选择器（按创建时间倒序）。未知或归档任务返回 404，不静默降级为空。
+- `last_used`：从常开的 `llm_usage` 记账读取该任务 planner / worker / mainagent 最近一次
+  实际调用（profile/model/status/时间），明确“不代表当前游标、记账无 effort 列”；无记录时
+  说明原因。来源优先级展示“实际生效层”，角色卡片补 reason/format/model。
+- 只读：不构建 provider、不发请求、不返回凭据；错误文本剔除 Bearer、`sk-`、
+  api_key/token、URL userinfo 后截断。静态可用性仅表示配置完整性，不验证连通性。
+- 任务链快照改为 DB 单语句读取；`activity` 增加 `(exploration_id, id) WHERE kind IN
+  ('llm_switch','llm_failover')` 偏索引。
+- 全链路页新增「装配链 | LLM 路由」视图切换，两个视图共用外壳与 Agent 选择器。
+
+### 变更：全链路装配视图保留门控信号流设计并修复拥挤
+
+- **保留设计**：#62 的门控信号流信息架构不变——左侧 LLM 解析梯与 Skill 轨、中部单路径
+  主干（Agent → 独立提示词 → 正文 → 技能 → 硬尾 → 门控 → 运行时 → 延迟 → 模型请求）、
+  右侧工具/MCP 轨、底部隔离架与 TERMINAL 硬边界、顶部态势带与指示灯。
+- **几何层重构**：`web/src/lib/chain-layout.ts` 改为纯函数（无 React/DOM，1 SVG 单位 =
+  1 CSS px），所有坐标由容器实测宽度推导，删除固定 990 viewBox 与整体等比缩放。
+- **响应式**：断点 1040/720 切换三列/两列/单列；窄屏主干保持首位、侧栏依次下移，
+  不再靠缩小字号容纳；主干列宽 ≥240px、宽屏最多 560px，三列整组在超宽屏居中，列距 ≥16px。
+- **可读性**：标题 11px、元信息 8px 固定；文案按真实字体栈（canvas measure）裁切，
+  全文在详情面板与 tooltip；默认 1:1 不产生横向滚动。
+- **点选即配置**：点击任一组件，右侧面板直接给出「全链路态势」条（当前段高亮、前后段可点转跳）、
+  思考强度覆盖（Agent × 配置）与独立提示词编辑（位置/继承/字符数，保存后下一次模型调用生效），
+  以及 Agent / LLM / Skill / 工具 / MCP 的配置入口；图中上游段保持正常、下游段半透明，
+  形成「已进入 → 当前 → 还将追加」的推进感。详情面板与画布并排，宽屏保持两/三列不塌成单列。
+- **高度与信息密度**：外壳/画布补全高度链，画布内部滚动、底部可达；顶部态势带可折叠、
+  告警默认收起，把高度让给图。
+- **兜底交互**：缩放（0.5×–2.5×，Ctrl/⌘+滚轮或按钮）、适应宽度、1:1、滚动同步的小地图；
+  滚轮不再劫持整页缩放；输入框内的 Esc 不关闭详情。路径钻取与返回保持原行为。
+- **收尾修正**：SVG 节点焦点环恢复可见（移除会覆盖 `--tw-outline-style` 的 `outline-none`）；
+  两列模式下「注入 / 运行时 / 第二 system」胶囊与连接线不再压到左轨；关闭详情不把视图拉回左上角，
+  并把焦点还给原节点；小地图在视口未测量时不再产生负宽 rect，回车改为跳到整图中心；
+  「不注入」在文本非空时禁用并拦截保存（避免服务端按 prepend 落库）；切换 Agent 时先清旧图；
+  态势段顺序与 `agent/prompt.go` 的 prepend/append/replace 一致；无 MCP 时显示「未绑定 MCP」；
+  路由状态补 `quota_exhausted` 文案；mock 的 effort 覆盖、`?profile_id=`、提示词回填与任务配置链
+  与真实端点同语义。
+- **测试**：`npm test` 共 19 项（几何 12 项：断点、三档宽度与 500 组随机宽度下无重叠/无越界、
+  主干宽下限、窄屏堆叠顺序、硬边界（显式构造 code 行，不再空转）、`fitText`/`wrapText`）；
+  已接入 GitHub Actions 与容器 CI。
+
+
+## [0.4.120] - 2026-11-25
+
+### 修复：附件配额与落盘清理闭环（#59）
+
+- DELETE 按 data 目录解析 `storage_path`，并清理 `.thumb.jpg` 与 `previews/<id>`；
+- 去重前置于配额检查，重复登记幂等；任务级 advisory lock 内完成去重/配额/插入；
+- 配额查询失败 fail-closed；scan 走同一配额并在触顶时停止。
+
+### 新增：任务级多角色测试凭据池（#24）
+
+- 新增 `task_credentials` 表与 `/api/tasks/{id}/credentials` CRUD/自检接口；支持角色命名、
+  form/JSON/Basic/Bearer/Cookie 与 TOTP，旧单账号 `tasks.auth_config` 保持兼容。
+- 秘密只进 DB；planner/worker prompt 只暴露 credential_id/角色/登录地址/健康状态。
+- `session_login(credential_id=...)` 由平台解析 URL 与秘密；连续 2 次 401/403 熔断 30 分钟，
+  凭据变更后自动复位。
+- 任务总览支持逐条添加/编辑/删除/自检。
+
+### 新增：未引用流量 TTL 清理（#25）
+
+- 新增 `traffic_retention_days`（默认 0=关闭）、`GET/POST /api/traffic/retention`；
+- 支持 dry-run 预览、手动执行与后台 6h 清理；
+- 保护集从 evidence snapshot / finding regression / finding timeline / 探索图读取，
+  查询失败立即中止；删除复用 FTS/bodies/blob_refs/exchanges 与增量 vacuum。
+
 ## [0.4.119] - 2026-11-25
 ### 新增：确定性回归库（P2-7）
 

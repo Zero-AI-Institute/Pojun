@@ -21,6 +21,7 @@ import type {
   FindingTraffic,
   FindingTrafficBinding,
   IntentAsset,
+  ProgramProfile,
   RetestState,
   ScopeRow,
   Task,
@@ -35,6 +36,14 @@ import type {
   TrafficEvidenceSnapshot,
 } from "../types";
 import * as D from "./data";
+import { hostenvStatus } from "./hostenv";
+import {
+  getMockEffortOverride,
+  getMockProfilePrompt,
+  mockPromptChain,
+  setMockEffortOverride,
+  setMockProfilePrompt,
+} from "./prompt-chain";
 
 const delay = (ms = 120) => new Promise((r) => setTimeout(r, ms));
 
@@ -1015,6 +1024,11 @@ export async function mockHandle<T>(method: string, rawPath: string, body?: Body
 function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Record<string, unknown>): unknown {
   const task = q.get("task") ?? undefined;
 
+  // demo 顶栏展示当前版本；真实后端由 ldflags 注入。
+  if (path === "/version" && m === "GET") return { service: "pojun", version: "v0.4.121" };
+  if (path === "/hostenv/status" && m === "GET") return structuredClone(hostenvStatus);
+  if (path === "/vulnintel/status" && m === "GET") return structuredClone(D.vulnintelStatus);
+
   if (path === "/chat/mentions" && m === "GET") {
     const kind = q.get("kind") ?? "";
     const query = (q.get("q") ?? "").trim().toLowerCase();
@@ -1351,6 +1365,87 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
     if (index >= 0) mockTaskTemplates.splice(index, 1);
     return { deleted: id };
   }
+  // ── 任务总览：目标 / 操作约束 / SRC Program Profile / 出口回执 ──
+  if (seg[0] === "tasks" && seg[2] === "goals" && seg.length === 3 && m === "GET") {
+    return { goals: structuredClone(D.taskGoalsByTask[seg[1]] ?? []) };
+  }
+  if (seg[0] === "tasks" && seg[2] === "goals" && seg.length === 3 && m === "POST") {
+    const list = (D.taskGoalsByTask[seg[1]] ??= []);
+    const goal = {
+      id: `g-mock-${Date.now()}`,
+      text: String(b.text ?? "").trim(),
+      vulnclass: String(b.vulnclass ?? "").trim() || undefined,
+      state: "open",
+      origin: "operator",
+      ts: new Date().toISOString(),
+    };
+    list.push(goal);
+    return structuredClone(goal);
+  }
+  if (seg[0] === "tasks" && seg[2] === "goals" && seg.length === 4 && m === "PATCH") {
+    const list = D.taskGoalsByTask[seg[1]] ?? [];
+    const goal = list.find((item) => item.id === seg[3]);
+    if (!goal) throw new Error("目标不存在");
+    if (typeof b.text === "string") goal.text = b.text.trim();
+    if (typeof b.vulnclass === "string") goal.vulnclass = b.vulnclass.trim() || undefined;
+    return structuredClone(goal);
+  }
+  if (seg[0] === "tasks" && seg[2] === "goals" && seg.length === 4 && m === "DELETE") {
+    const list = D.taskGoalsByTask[seg[1]] ?? [];
+    const index = list.findIndex((item) => item.id === seg[3]);
+    if (index >= 0) list.splice(index, 1);
+    return { ok: true };
+  }
+  if (seg[0] === "tasks" && seg[2] === "constraints" && seg.length === 3 && m === "GET") {
+    return { constraints: structuredClone(D.taskConstraintsByTask[seg[1]] ?? []) };
+  }
+  if (seg[0] === "tasks" && seg[2] === "constraints" && seg.length === 3 && m === "POST") {
+    const list = (D.taskConstraintsByTask[seg[1]] ??= []);
+    const constraint = {
+      id: `c-mock-${Date.now()}`,
+      kind: (b.kind === "deny" ? "deny" : "allow") as "allow" | "deny",
+      text: String(b.text ?? "").trim(),
+      origin: "operator",
+      ts: new Date().toISOString(),
+    };
+    list.push(constraint);
+    return structuredClone(constraint);
+  }
+  if (seg[0] === "tasks" && seg[2] === "constraints" && seg.length === 4 && m === "PATCH") {
+    const list = D.taskConstraintsByTask[seg[1]] ?? [];
+    const constraint = list.find((item) => item.id === seg[3]);
+    if (!constraint) throw new Error("约束不存在");
+    if (typeof b.text === "string") constraint.text = b.text.trim();
+    if (b.kind === "allow" || b.kind === "deny") constraint.kind = b.kind;
+    return structuredClone(constraint);
+  }
+  if (seg[0] === "tasks" && seg[2] === "constraints" && seg.length === 4 && m === "DELETE") {
+    const list = D.taskConstraintsByTask[seg[1]] ?? [];
+    const index = list.findIndex((item) => item.id === seg[3]);
+    if (index >= 0) list.splice(index, 1);
+    return { ok: true };
+  }
+  if (seg[0] === "tasks" && seg[2] === "program-profile" && seg.length === 3 && m === "GET") {
+    return { task_id: seg[1], profile: structuredClone(D.programProfilesByTask[seg[1]] ?? null) };
+  }
+  if (seg[0] === "tasks" && seg[2] === "program-profile" && seg.length === 3 && m === "PUT") {
+    const raw = b.profile && typeof b.profile === "object" ? b.profile : b;
+    const profile = raw as ProgramProfile;
+    if (profile && Object.keys(profile).length > 0) D.programProfilesByTask[seg[1]] = structuredClone(profile);
+    else delete D.programProfilesByTask[seg[1]];
+    return { task_id: seg[1], profile: structuredClone(D.programProfilesByTask[seg[1]] ?? null) };
+  }
+  if (seg[0] === "tasks" && seg[2] === "egress" && seg.length === 3 && m === "GET") {
+    return structuredClone(
+      D.taskEgressByTask[seg[1]] ?? {
+        task_id: seg[1],
+        built: false,
+        compatible: true,
+        reason: "not_built",
+      },
+    );
+  }
+
   if (seg[0] === "tasks" && seg.length === 2 && m === "GET") {
     const task = mockTasks.find((item) => item.id === seg[1]);
     if (!task) throw new Error("任务不存在");
@@ -1879,6 +1974,28 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
     return { deleted: 1, assets_deleted: assetsDeleted };
   }
 
+  // ── 确定性回归检查（v0.4.119）──
+  if (seg[0] === "findings" && seg[2] === "regression" && seg.length === 3 && m === "GET") {
+    return { finding_id: seg[1], regression: structuredClone(D.findingRegressions[seg[1]] ?? null) };
+  }
+  if (seg[0] === "findings" && seg[2] === "regression" && seg[3] === "check" && m === "POST") {
+    const regression = D.findingRegressions[seg[1]];
+    if (!regression) throw new Error("该漏洞没有可重放的回归 spec");
+    const now = new Date().toISOString();
+    regression.last_checked_at = now;
+    regression.last_verdict = "pass";
+    regression.last_note = `回放 proof 流量命中 ${regression.assertion} 断言，HTTP ${regression.expected_status}。`;
+    return {
+      finding_id: seg[1],
+      verdict: "pass",
+      note: regression.last_note,
+      status: regression.expected_status,
+      matched: true,
+      assertion: regression.assertion,
+      regression: structuredClone(regression),
+    };
+  }
+
   // ── exploration ──
   if (path === "/exploration/frontier") return D.frontier;
   if (path === "/exploration/findings/stats") {
@@ -2252,6 +2369,16 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
   if (path === "/traffic" && m === "DELETE") return { deleted: 0 };
   if (path === "/traffic/hosts" && m === "DELETE") return { deleted: (b.hosts as unknown[])?.length ?? 0 };
   if (path === "/traffic/hosts") return { hosts: D.trafficHosts };
+  if (path === "/traffic/retention") {
+    const status = {
+      days: 30, enabled: true, cutoff: Math.floor(Date.now() / 1000) - 30 * 86400,
+      total: 19, candidates: 3, protected: 2, deletable: 1,
+    };
+    if (m === "POST") {
+      return { ...status, dry_run: b.dry_run !== false, deleted: b.dry_run === false ? 1 : 0, legacy_dirs: 0, blob_reclaimed: true };
+    }
+    return status;
+  }
   if (path === "/traffic") return D.traffic;
   if (path === "/traffic/exchange") return D.trafficDetail;
   if (path === "/settings" && m === "GET") return D.settings;
@@ -2293,8 +2420,24 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
   if (path === "/llm" && m === "POST") return { ok: true };
   if (path === "/llm/test")
     return { ok: true, latency_ms: 128, model: String(b.model ?? "claude-opus-4-8"), reply: "OK" };
-  if (path === "/llm/profiles" && m === "GET") return { profiles: D.llmProfiles };
-  if (path === "/llm/profiles" && m === "POST") return { id: Number(b.id) || 3 };
+  if (path === "/llm/profiles" && m === "GET") {
+    // 演示模式下把配置面板保存过的独立提示词回填，否则再打开抽屉会看到旧文本。
+    return {
+      profiles: D.llmProfiles.map((p) => {
+        const edit = getMockProfilePrompt(Number(p.id));
+        return edit
+          ? { ...p, prompt: edit.prompt, prompt_mode: edit.mode, prompt_apply_inherited: edit.inherit }
+          : p;
+      }),
+    };
+  }
+  if (path === "/llm/profiles" && m === "POST") {
+    const pid = Number(b.id) || 0;
+    if (pid > 0) {
+      setMockProfilePrompt(pid, String(b.prompt ?? ""), String(b.prompt_mode ?? ""), Boolean(b.prompt_apply_inherited));
+    }
+    return { id: pid || 3 };
+  }
   if (path === "/llm/profiles/active") return { ok: true };
   if (path === "/llm/pool" && m === "GET") return D.llmPool;
   if (path === "/llm/pool/reset")
@@ -2315,11 +2458,47 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
     };
   if (seg[0] === "agents" && seg.length === 2 && m === "GET") return D.agentDetail(seg[1]);
   if (seg[0] === "agents" && seg[2] === "triggers" && m === "GET") return { triggers: [] };
+  if (seg[0] === "agents" && seg[2] === "prompt" && seg[3] === "chain" && m === "GET")
+    return mockPromptChain(seg[1], q.get("profile_id") ?? undefined);
   if (seg[0] === "agents" && seg[2] === "prompts") return { versions: D.agentDetail(seg[1]).versions };
   if (seg[0] === "agents" && seg[2] === "variables") return { variables: D.agentDetail(seg[1]).variables };
   if (seg[0] === "agents" && seg[2] === "prompt" && seg[3] === "preview")
     return { rendered: String(b.template ?? "").replace(/\{\{\.(\w+)\}\}/g, "«$1»") };
   if (seg[0] === "agents" && seg[2] === "visibility" && m === "GET") return D.agentDetail(seg[1]).visibility;
+  // 只读 LLM 路由投影：与真实端点同形状，运行期历史在演示数据里明确为空。
+  if (seg[0] === "agents" && seg[2] === "llm-route" && m === "GET")
+    return D.agentLLMRoute(seg[1], q.get("task_id") ?? undefined);
+  // 每 Agent 的思考强度覆盖：读写同一份内存状态，保存后 Agent 编辑器能立即看到。
+  if (seg[0] === "agents" && seg[2] === "llm-effort-overrides" && m === "GET") {
+    const overrides: { profile_id: number; effort: string; updated_at?: string }[] = [];
+    const profiles = D.llmProfiles.map((p) => {
+      const profileEffort = p.reasoning_effort ?? "";
+      const ov = getMockEffortOverride(seg[1], Number(p.id));
+      const overrideEffort = ov && ov !== "" ? ov : "";
+      if (overrideEffort) overrides.push({ profile_id: Number(p.id), effort: overrideEffort });
+      const effort = overrideEffort || profileEffort;
+      return {
+        profile_id: Number(p.id),
+        name: p.name,
+        format: p.format,
+        model: p.model,
+        is_default: p.is_default,
+        has_key: true,
+        profile_effort: profileEffort,
+        effort,
+        source: overrideEffort ? "override" : profileEffort ? "profile" : "unset",
+      };
+    });
+    return { agent_key: seg[1], overrides, profiles };
+  }
+  if (seg[0] === "agents" && seg[2] === "llm-effort-overrides" && seg.length === 4) {
+    // 演示模式下把覆盖记在内存里，右侧配置面板保存后立即能在图上看到。
+    const pid = Number(seg[3]);
+    if (m === "PUT") setMockEffortOverride(seg[1], pid, String(b.reasoning_effort ?? ""));
+    if (m === "DELETE") setMockEffortOverride(seg[1], pid, "");
+    return {};
+  }
+  if (seg[0] === "agents" && seg[2] === "llm-effort-overrides") return {}; // 其余方法：演示模式不落库
 
   // ── conversations ──
   if (path === "/conversations" && m === "GET") {
