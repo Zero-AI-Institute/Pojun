@@ -66,6 +66,10 @@ import type {
   InterceptRule,
   JudgeConfig,
   JudgeUsage,
+  KnowledgeEntry,
+  KnowledgeEntryInput,
+  KnowledgeFacets,
+  KnowledgeRetrievalStats,
   LLMPoolStatus,
   LLMProfile,
   LLMRecordDetail,
@@ -83,11 +87,15 @@ import type {
   NotificationMeta,
   PromptVar,
   PromptVersion,
+  ResourceManual,
+  ResourceStatus,
   SessionTokenUsage,
   Settings,
   LLMPreset,
   LLMModelMeta,
   LLMCheckResult,
+  LLMURLHint,
+  LLMProbeResult,
   AuthCheckResult,
   TaskCredential,
   TaskCredentialCheck,
@@ -127,6 +135,7 @@ import type {
   TrafficResp,
   TrafficRetentionResult,
   TrafficRetentionStatus,
+  CleanupJob,
   ProxyPoolState,
   LocalProxyCandidate,
   MihomoStatus,
@@ -139,6 +148,11 @@ import type {
   ListenerStartResp,
   ListenerView,
   UpdateCheck,
+  UpdateProxyTestResult,
+  TLSACMEConfig,
+  TLSCertInfo,
+  TLSSettings,
+  TLSStatusResp,
   UsageStats,
   VulnIntelConfigPatch,
   VulnIntelStatus,
@@ -974,10 +988,49 @@ export const api = {
   trafficRetention: () => get<TrafficRetentionStatus>(`/traffic/retention`),
   trafficRetentionRun: (dryRun = true) =>
     post<TrafficRetentionResult>(`/traffic/retention`, { dry_run: dryRun }),
+  // 删除后的异步清理队列：流量/LLM/文件在后台分批处理。
+  cleanupJobs: (activeOnly = false) =>
+    get<{ jobs: CleanupJob[] }>(`/cleanup/jobs${activeOnly ? "?active=1" : ""}`),
+  retryCleanupJob: (id: number) => post<{ ok: boolean }>(`/cleanup/jobs/${id}/retry`, {}),
 
   // ---- app settings (runtime toggles) ----
   settings: () => get<Settings>(`/settings`),
   setSettings: (patch: Partial<Settings>) => put<Settings>(`/settings`, patch),
+
+  // ---- 资源自适应（容量探测 / 计划 / 手工覆盖） ----
+  resourceStatus: () => get<ResourceStatus>(`/resource`),
+  updateResource: (patch: {
+    auto_tune?: boolean;
+    mode?: "auto" | "manual";
+    threshold_high?: number;
+    threshold_critical?: number;
+    auto_pause_scans?: boolean;
+    manual?: ResourceManual;
+  }) => put<ResourceStatus>(`/resource`, patch),
+  retuneResource: () => post<ResourceStatus>(`/resource/retune`, {}),
+
+  // ---- 内置 HTTPS 与证书管理 ----
+  tlsStatus: () => get<TLSStatusResp>(`/tls/status`),
+  saveTLSSettings: (patch: Partial<TLSSettings>) =>
+    put<{ ok: boolean; needs_restart: boolean; settings: TLSSettings }>(`/tls/settings`, patch),
+  tlsImport: (certPEM: string, keyPEM: string) =>
+    post<{ ok: boolean; cert: TLSCertInfo; needs_restart: boolean }>(`/tls/import`, {
+      cert_pem: certPEM,
+      key_pem: keyPEM,
+    }),
+  tlsSelfSigned: (sans: string[]) =>
+    post<{ ok: boolean; cert: TLSCertInfo; needs_restart: boolean }>(`/tls/selfsigned`, { sans }),
+  tlsIssueACME: (cfg: TLSACMEConfig) => post<{ ok: boolean; running: boolean; needs_restart?: boolean }>(`/tls/acme`, cfg),
+  tlsCancelACME: () => post<{ ok: boolean }>(`/tls/acme/cancel`, {}),
+  tlsRestart: () => post<{ ok: boolean; restarting: boolean }>(`/tls/restart`, {}),
+  downloadTLSCA: async () => {
+    const token = getToken();
+    const r = await fetch(`/api/tls/ca.pem`, {
+      headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+    });
+    if (!r.ok) throw new Error(`下载 CA 失败: ${r.status}`);
+    triggerBlobDownload(await r.blob(), "pojun-ca.pem");
+  },
   // Run a real "test" search with the given (or saved) config to verify it works.
   testWebSearch: (patch: {
     web_search_backend?: string;
@@ -1336,9 +1389,18 @@ export const api = {
     prompt?: string;
     prompt_mode?: string;
     prompt_apply_inherited?: boolean;
-  }) => post<{ id: number }>("/llm/profiles", p),
+    // 视觉三态：""=自动/on=支持/off=不支持
+    vision_mode?: "" | "on" | "off";
+  }) => post<{ id: number; base_url?: string; normalized?: boolean; note?: string }>("/llm/profiles", p),
   deleteLLMProfile: (id: string) => del<{ deleted: number }>(`/llm/profiles/${id}`),
   activateLLMProfile: (id: string) => post<{ ok: boolean }>("/llm/profiles/active", { id: Number(id) }),
+  // 「测试视觉」：发一张 64×64 纯红 PNG 问颜色，确认模型/网关真的能读图。
+  // 只读配置（除缓存探测结论外不改设置）；成功/失败都会写回探测缓存。
+  llmVisionProbe: (profile_id: number) =>
+    post<{ ok: boolean; reply?: string; latency_ms?: number; error?: string; hint?: string }>(
+      "/llm/vision-probe",
+      { profile_id },
+    ),
   // 轮询链的实际顺序 + 各配置的熔断状态。
   llmPool: () => get<LLMPoolStatus>("/llm/pool"),
   // 清除熔断，让下一次调用立刻重试该配置；不传 id = 全部清除。
@@ -1356,9 +1418,42 @@ export const api = {
       user_agent,
     }),
 
-  // 厂商知识层（v0.4.91）：预设清单 / 模型元数据推断 / 连通分诊
+  // 厂商知识层（v0.4.91）：预设清单 / 模型元数据推断 / 连通分诊 / 地址归一与探测
   llmPresets: () => get<{ presets: LLMPreset[] }>("/llm/presets"),
-  llmModelMeta: (model: string) => get<LLMModelMeta>(`/llm/model-meta?model=${encodeURIComponent(model)}`),
+  llmModelMeta: (model: string, format = "") =>
+    get<LLMModelMeta>(
+      `/llm/model-meta?model=${encodeURIComponent(model)}${format ? `&format=${encodeURIComponent(format)}` : ""}`,
+    ),
+  // Base URL 失焦提示：纯本地归一 + 协议建议（不发网络请求）。
+  llmURLHint: (format: string, base_url: string, model = "") =>
+    post<LLMURLHint>("/llm/url-hint", { format, base_url, model }),
+  // 自动探测可用组合（当前协议×地址候选 + 备选协议，最多 4 组，总预算 25s）。
+  llmProbe: (
+    provider: string,
+    model: string,
+    base_url: string,
+    api_key: string,
+    proxy = "",
+    thinking_type = "",
+    reasoning_effort = "",
+    profile_id?: number,
+    streaming?: boolean,
+    session_header_key = "",
+    user_agent = "",
+  ) =>
+    post<LLMProbeResult>("/llm/probe", {
+      provider,
+      model,
+      base_url,
+      api_key,
+      proxy,
+      thinking_type,
+      reasoning_effort,
+      profile_id,
+      streaming,
+      session_header_key,
+      user_agent,
+    }),
   llmCheck: (provider: string, base_url: string, api_key: string, proxy = "", profile_id?: number, user_agent = "") =>
     post<LLMCheckResult>("/llm/check", {
       provider,
@@ -1712,6 +1807,8 @@ export const api = {
   // 202 即返回，实际下载在后台跑，进度走 /api/update/stream。
   applyUpdate: () => post<{ ok: boolean; target: string }>(`/update/apply`),
   rollbackUpdate: () => post<{ ok: boolean }>(`/update/rollback`),
+  // 更新代理连通性：用给定（或当前生效）代理真实查一次 GitHub Release，20s 超时。
+  testUpdateProxy: (proxy: string) => post<UpdateProxyTestResult>(`/update/proxy-test`, { proxy }),
 
   // ---- C2 出口 / 回连接收器（红队作战）----
   // C2 出口配置：password 传 "" 清空、undefined 保持不变；回显已脱敏（只回 has_pass）。
@@ -1726,4 +1823,48 @@ export const api = {
     post<{ stopped: string; sessions: ListenerSession[] }>(`/listeners/${encodeURIComponent(name)}/stop`),
   listenerSessions: (name: string) =>
     get<{ name: string; sessions: ListenerSession[] }>(`/listeners/${encodeURIComponent(name)}`),
+
+  // ---- 知识库（KB v2）----
+  // 列表支持 q/status/layer/origin/tag/product/vuln_class/min_quality 过滤；
+  // 管理页只在需要时传参，避免 URL 里堆一长串空值。
+  knowledgeList: (params?: {
+    q?: string;
+    status?: string;
+    layer?: string;
+    origin?: string;
+    tag?: string;
+    product?: string;
+    vuln_class?: string;
+    min_quality?: number;
+    page?: number;
+    page_size?: number;
+  }) => {
+    const sp = new URLSearchParams();
+    if (params?.q) sp.set("q", params.q);
+    if (params?.status) sp.set("status", params.status);
+    if (params?.layer) sp.set("layer", params.layer);
+    if (params?.origin) sp.set("origin", params.origin);
+    if (params?.tag) sp.set("tag", params.tag);
+    if (params?.product) sp.set("product", params.product);
+    if (params?.vuln_class) sp.set("vuln_class", params.vuln_class);
+    if (params?.min_quality !== undefined) sp.set("min_quality", String(params.min_quality));
+    sp.set("page", String(params?.page ?? 1));
+    sp.set("page_size", String(params?.page_size ?? 20));
+    return get<{ entries: KnowledgeEntry[]; total: number; page: number; page_size: number }>(
+      `/knowledge?${sp}`,
+    );
+  },
+  knowledgeStats: () =>
+    get<{ counts: Record<string, number> }>(`/knowledge/stats`).then((r) => r.counts),
+  knowledgeFacets: (status?: string) =>
+    get<{ facets: KnowledgeFacets }>(
+      `/knowledge/facets${status ? `?status=${encodeURIComponent(status)}` : ""}`,
+    ).then((r) => r.facets),
+  // days 由后端以文本参数绑定到 interval，不会触发 pgx int→text 500。
+  knowledgeRetrievalStats: (days = 7) =>
+    get<KnowledgeRetrievalStats>(`/knowledge/retrieval-stats?days=${days}`),
+  createKnowledge: (input: KnowledgeEntryInput) => post<KnowledgeEntry>(`/knowledge`, input),
+  updateKnowledge: (id: number, input: KnowledgeEntryInput) =>
+    patch<KnowledgeEntry>(`/knowledge/${id}`, input),
+  deleteKnowledge: (id: number) => del<{ deleted?: boolean }>(`/knowledge/${id}`),
 };

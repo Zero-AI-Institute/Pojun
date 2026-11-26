@@ -305,6 +305,9 @@ ON CONFLICT (name) DO NOTHING`,
 	if err := d.seedBuiltinTaskPlaybooksV2(); err != nil {
 		return fmt.Errorf("seed task playbooks v2: %w", err)
 	}
+	if err := d.seedBuiltinTaskPlaybooksV4(); err != nil {
+		return fmt.Errorf("seed task playbooks v4: %w", err)
+	}
 	if err := d.seedDefaultInterceptRules(); err != nil {
 		return fmt.Errorf("seed intercept rules: %w", err)
 	}
@@ -411,6 +414,8 @@ var builtinSkillVisibility = map[string][]string{
 	"apk-reverse":    {"pentest", "worker"},
 	// 微信小程序：包在 uploads，先解包再静态/动态测试；执行面绑 worker/pentest。
 	"mini-program": {"pentest", "worker"},
+	// 任务早期轻量威胁建模：规划者/主 Agent 定优先级，执行面按需引用。
+	"threat-modeling": {"planner", "mainagent", "pentest"},
 }
 
 // seedBuiltinSkillVisibility binds the shipped built-in skills to their default

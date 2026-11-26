@@ -254,7 +254,7 @@ WHERE archive.id=$1 FOR UPDATE OF archive,task`, archiveID).Scan(&taskID, &expID
 	}
 	// Insert graph rows in foreign-key order. The archived stub has no graph rows,
 	// so an ID conflict signals external corruption and must stop the restore.
-	for _, table := range []string{"exploration_nodes", "exploration_edges", "exploration_anchors", "task_constraints", "activity"} {
+	for _, table := range []string{"exploration_nodes", "intent_reflections", "exploration_edges", "exploration_anchors", "task_constraints", "activity"} {
 		if err := insertArchiveRows(tx, table, remappedTables[table]); err != nil {
 			return nil, fmt.Errorf("restore %s: %w", table, err)
 		}
@@ -337,6 +337,7 @@ func restoreTaskStub(tx *sql.Tx, row map[string]any, taskID, remaining int64) er
  name=archived.name,category_id=archived.category_id,description=archived.description,goal=archived.goal,
  status=archived.status,paused=archived.paused,queued=false,queued_at=NULL,queue_mode='',
  paused_at=CASE WHEN archived.paused THEN now() ELSE NULL END,
+ paused_total_seconds=COALESCE(archived.paused_total_seconds,0),
  llm_profile_id=archived.llm_profile_id,active_llm_profile_id=archived.active_llm_profile_id,
  llm_chain_revision=archived.llm_chain_revision,company_id=archived.company_id,parent_ref=archived.parent_ref,
  timeout_seconds=archived.timeout_seconds,plan_heartbeat_seconds=archived.plan_heartbeat_seconds,
@@ -404,7 +405,7 @@ func insertArchiveRows(tx *sql.Tx, table string, raw json.RawMessage) error {
 		}
 	}
 	allowed := map[string]bool{
-		"exploration_nodes": true, "exploration_edges": true, "exploration_anchors": true,
+		"exploration_nodes": true, "intent_reflections": true, "exploration_edges": true, "exploration_anchors": true,
 		"task_constraints": true, "task_credentials": true, "activity": true, "task_asset_links": true, "findings": true,
 		"finding_regressions": true,
 		"llm_records":         true, "llm_usage": true, "skill_usage": true, "tool_usage": true,

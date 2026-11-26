@@ -117,29 +117,52 @@ func (s *Store) UpsertCVE(ctx context.Context, c CVE) error {
 // MarkKEV sets the in-the-wild exploitation flag. Rows unknown to the NVD sync
 // (KEV moves faster than NVD sometimes) get a stub row so the flag is visible.
 func (s *Store) MarkKEV(ctx context.Context, cveID string, added time.Time) error {
-	tag := "KEV: " + added.Format("2006-01-02")
-	res, err := s.db.ExecContext(ctx, `UPDATE vuln_cves SET kev=true, kev_date_added=$2 WHERE cve_id=$1`, cveID, nullTime(added))
+	return s.MarkKEVEntry(ctx, KevEntry{CVEID: cveID, DateAdded: added})
+}
+
+// MarkKEVEntry marks one KEV entry and, for CVEs the NVD sync has not reached
+// yet, inserts the minimal CPE product row that makes it reachable by
+// search_vulns (its JOIN would otherwise hide KEV-only records).
+func (s *Store) MarkKEVEntry(ctx context.Context, e KevEntry) error {
+	tag := "KEV: " + e.DateAdded.Format("2006-01-02")
+	res, err := s.db.ExecContext(ctx, `UPDATE vuln_cves SET kev=true, kev_date_added=$2 WHERE cve_id=$1`, e.CVEID, nullTime(e.DateAdded))
 	if err != nil {
-		return fmt.Errorf("mark kev %s: %w", cveID, err)
+		return fmt.Errorf("mark kev %s: %w", e.CVEID, err)
 	}
-	if n, _ := res.RowsAffected(); n > 0 {
-		return nil
+	if n, _ := res.RowsAffected(); n == 0 {
+		_, err = s.db.ExecContext(ctx, `INSERT INTO vuln_cves (cve_id, source, title, severity, kev, kev_date_added)
+			VALUES ($1,'kev',$2,'UNKNOWN',true,$3) ON CONFLICT (cve_id) DO UPDATE SET kev=true, kev_date_added=$3`,
+			e.CVEID, tag, nullTime(e.DateAdded))
+		if err != nil {
+			return fmt.Errorf("insert kev stub %s: %w", e.CVEID, err)
+		}
 	}
-	_, err = s.db.ExecContext(ctx, `INSERT INTO vuln_cves (cve_id, source, title, severity, kev, kev_date_added)
-		VALUES ($1,'kev',$2,'UNKNOWN',true,$3) ON CONFLICT (cve_id) DO UPDATE SET kev=true, kev_date_added=$3`,
-		cveID, tag, nullTime(added))
-	if err != nil {
-		return fmt.Errorf("insert kev stub %s: %w", cveID, err)
+	vendor, product := normalizeKEVProduct(e.Vendor), normalizeKEVProduct(e.Product)
+	if vendor != "" && product != "" {
+		_, _ = s.db.ExecContext(ctx, `INSERT INTO vuln_cpe_products (cve_id, vendor, product)
+			VALUES ($1,$2,$3) ON CONFLICT (cve_id,vendor,product) DO NOTHING`, e.CVEID, vendor, product)
 	}
 	return nil
 }
 
+func normalizeKEVProduct(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	s = strings.NewReplacer(" ", "_", "/", "_", "\\", "_", "(", "", ")", "", ",", "").Replace(s)
+	return strings.Trim(s, "_-.")
+}
+
 // VulnHit 是 search_vulns 的单条结果（详情字段刻意精简，让 LLM 先看摘要）。
 type VulnHit struct {
-	CVEID     string   `json:"cve_id"`
-	Severity  string   `json:"severity"`
-	Score     *float64 `json:"cvss_score,omitempty"`
-	KEV       bool     `json:"kev"`
+	CVEID    string   `json:"cve_id"`
+	Severity string   `json:"severity"`
+	Score    *float64 `json:"cvss_score,omitempty"`
+	// EPSS / EPSSPercentile 是 FIRST 的 30 天利用概率（0–1）与百分位；nil=无评分。
+	// 排序语义：KEV > EPSS > 版本区间命中 > CVSS（见 SearchVulns 的 ORDER BY）。
+	EPSS           *float64 `json:"epss,omitempty"`
+	EPSSPercentile *float64 `json:"epss_percentile,omitempty"`
+	// EPSSDate 是该评分对应的打分日（YYYY-MM-DD）；空=无评分。
+	EPSSDate string `json:"epss_date,omitempty"`
+	KEV      bool   `json:"kev"`
 	Published string   `json:"published,omitempty"`
 	Title     string   `json:"title"`
 	// 命中的 (vendor, product) 对，LLM 用它确认检索词与目标组件对得上。
@@ -181,6 +204,7 @@ func (s *Store) SearchVulns(ctx context.Context, vendor, product, version string
 SELECT c.cve_id, c.severity, c.cvss_score, c.kev, COALESCE(c.published_at::text,''),
        COALESCE(c.title,''), c.kev_date_added IS NOT NULL AS kev_row,
        COALESCE(array_to_json(c.cwes)::text,'[]'),
+       c.epss, c.epss_percentile, COALESCE(to_char(c.epss_date,'YYYY-MM-DD'),''),
        COALESCE((
          SELECT string_agg(DISTINCT p.vendor || '/' || p.product, ', ')
          FROM vuln_cpe_products p WHERE p.cve_id = c.cve_id AND p.product ILIKE $1
@@ -192,6 +216,7 @@ JOIN vuln_cpe_products p ON p.cve_id = c.cve_id AND p.product ILIKE $1
                         AND ($2 = '' OR p.vendor ILIKE '%' || $2 || '%')
 GROUP BY c.id
 ORDER BY c.kev DESC,
+         COALESCE(c.epss,0) DESC,
          (CASE WHEN $3 <> '' AND c.cpe_criteria::text LIKE '%' || $3 || '%' THEN 1 ELSE 0 END) DESC,
          c.cvss_score DESC NULLS LAST, c.published_at DESC
 LIMIT $4`, args...)
@@ -205,7 +230,8 @@ LIMIT $4`, args...)
 		var h VulnHit
 		var kevRow bool
 		var matched, hitProduct, cwesJSON string
-		if err := rows.Scan(&h.CVEID, &h.Severity, &h.Score, &h.KEV, &h.Published, &h.Title, &kevRow, &cwesJSON, &matched, &hitProduct, &h.Source); err != nil {
+		if err := rows.Scan(&h.CVEID, &h.Severity, &h.Score, &h.KEV, &h.Published, &h.Title, &kevRow, &cwesJSON,
+			&h.EPSS, &h.EPSSPercentile, &h.EPSSDate, &matched, &hitProduct, &h.Source); err != nil {
 			return nil, err
 		}
 		h.Cwes = unmarshalStringArray([]byte(cwesJSON))
@@ -257,13 +283,18 @@ type VulnDetail struct {
 	Severity    string   `json:"severity"`
 	Score       *float64 `json:"cvss_score,omitempty"`
 	Vector      string   `json:"cvss_vector,omitempty"`
-	KEV         bool     `json:"kev"`
-	Published   string   `json:"published,omitempty"`
-	Modified    string   `json:"modified,omitempty"`
-	Title       string   `json:"title"`
-	Description string   `json:"description"`
-	Criteria    []string `json:"cpe_criteria,omitempty"`
-	Refs        []string `json:"references,omitempty"`
+	// EPSS / EPSSPercentile / EPSSDate 是 FIRST 每日利用概率评分（0–1）、百分位
+	// 与打分日；nil/空 = 尚未被 EPSS 覆盖（与「评分 0」不同）。
+	EPSS           *float64 `json:"epss,omitempty"`
+	EPSSPercentile *float64 `json:"epss_percentile,omitempty"`
+	EPSSDate       string   `json:"epss_date,omitempty"`
+	KEV            bool     `json:"kev"`
+	Published      string   `json:"published,omitempty"`
+	Modified       string   `json:"modified,omitempty"`
+	Title          string   `json:"title"`
+	Description    string   `json:"description"`
+	Criteria       []string `json:"cpe_criteria,omitempty"`
+	Refs           []string `json:"references,omitempty"`
 	// Source 是数据来源:nvd / ghsa。
 	Source string `json:"source,omitempty"`
 	// Cwes 是弱点编号（CWE-79 这类）——agent 侧据此提示对应方法论 skill。
@@ -318,9 +349,11 @@ func (s *Store) GetVuln(ctx context.Context, cveID string) (*VulnDetail, error) 
 	var pub, mod *time.Time
 	err := s.db.QueryRowContext(ctx, `SELECT cve_id, severity, cvss_score, COALESCE(cvss_vector,''),
 		kev, published_at, modified_at, title, description, cpe_criteria, refs, source,
-		COALESCE(array_to_json(cwes)::text,'[]')
+		COALESCE(array_to_json(cwes)::text,'[]'),
+		epss, epss_percentile, COALESCE(to_char(epss_date,'YYYY-MM-DD'),'')
 		FROM vuln_cves WHERE cve_id=$1`, cveID).
-		Scan(&d.CVEID, &d.Severity, &d.Score, &d.Vector, &d.KEV, &pub, &mod, &d.Title, &d.Description, &criteria, &refs, &d.Source, &cwes)
+		Scan(&d.CVEID, &d.Severity, &d.Score, &d.Vector, &d.KEV, &pub, &mod, &d.Title, &d.Description, &criteria, &refs, &d.Source, &cwes,
+			&d.EPSS, &d.EPSSPercentile, &d.EPSSDate)
 	if err == nil {
 		if pub != nil {
 			d.Published = pub.UTC().Format(time.RFC3339)
@@ -417,9 +450,9 @@ func (s *Store) GetSyncState(ctx context.Context, source string) (SyncState, err
 // SaveSyncState upserts the watermark row.
 func (s *Store) SaveSyncState(ctx context.Context, st SyncState) error {
 	_, err := s.db.ExecContext(ctx, `INSERT INTO vuln_sync_state (source, last_sync_at, cursor, total_synced, last_error, enabled, page_cursor)
-		VALUES ($1, COALESCE($2::timestamptz, now()), $3, $4, $5, $6, $7)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
 		ON CONFLICT (source) DO UPDATE SET
-		  last_sync_at=COALESCE($2::timestamptz, now()), cursor=EXCLUDED.cursor,
+		  last_sync_at=COALESCE($2::timestamptz, vuln_sync_state.last_sync_at), cursor=EXCLUDED.cursor,
 		  total_synced=EXCLUDED.total_synced, last_error=EXCLUDED.last_error, enabled=EXCLUDED.enabled,
 		  page_cursor=EXCLUDED.page_cursor`,
 		st.Source, st.LastSyncAt, st.Cursor, st.TotalSynced, st.LastError, st.Enabled, st.PageCursor)

@@ -8,14 +8,106 @@ import (
 	"encoding/json"
 	"iter"
 	"log"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
-	"github.com/chu0119/pojun/db"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/transcript"
+	"github.com/chu0119/pojun/db"
 )
+
+// BodyMode controls how much request/response content is persisted.
+//   - off:    metadata only (tokens/status/error).
+//   - errors: bodies only for failed calls, truncated to 64 KiB each.
+//   - full:   everything (historical behavior).
+//
+// The server passes a live settings resolver to Wrap; library users/tests keep
+// the historical "full" default.
+var BodyMode = func() string { return "full" }
+
+const maxErrorBodyBytes = 64 << 10
+
+func applyBodyMode(mode, status, reqBody, respBody, rawReq, rawResp string) (string, string, string, string) {
+	// 图片 base64 先清洗再截断/落库：一张截图 ~1MB，审计表会被撑爆，删任务时
+	// 这些大 TEXT 也会拖慢清理。线上请求不受影响（这里只处理审计副本）。
+	reqBody, rawReq = scrubImageB64(reqBody), scrubImageB64(rawReq)
+	respBody, rawResp = scrubImageB64(respBody), scrubImageB64(rawResp)
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "off":
+		return "", "", "", ""
+	case "errors":
+		if status != "error" {
+			return "", "", "", ""
+		}
+		return truncateRecordedBody(reqBody), truncateRecordedBody(respBody),
+			truncateRecordedBody(rawReq), truncateRecordedBody(rawResp)
+	default:
+		return reqBody, respBody, rawReq, rawResp
+	}
+}
+
+// imageJSONDataRE matches "data":"<long base64>" in a serialized image block.
+var imageJSONDataRE = regexp.MustCompile(`("data"\s*:\s*")[A-Za-z0-9+/=]{512,}"`)
+
+// imageStructDataRE matches the unambiguous image-block shape
+// ("type":"image" … "source":{… "data":"…"}) at ANY payload length, so even a
+// tiny probe image (a 64×64 solid PNG is only a couple hundred base64 chars)
+// never lands in the audit table.
+var imageStructDataRE = regexp.MustCompile(`("type"\s*:\s*"image"[^{}]*?"source"\s*:\s*\{[^{}]*?"data"\s*:\s*")[A-Za-z0-9+/=]+"`)
+
+// imageDataURIRE matches a data:image/...;base64 payload inside an
+// image_url (OpenAI shape). The prefix alone identifies it as image data, so no
+// length floor is needed.
+var imageDataURIRE = regexp.MustCompile(`data:image/[A-Za-z0-9.+-]+;base64,[A-Za-z0-9+/=]+`)
+
+// scrubImageB64 replaces base64 image payloads with a short marker so audit rows
+// stay small. The request that actually goes on the wire is unaffected.
+func scrubImageB64(s string) string {
+	if s == "" || (!strings.Contains(s, "base64") && !strings.Contains(s, `"data"`)) {
+		return s
+	}
+	replaceData := func(m string) string {
+		// Keep everything up to and including `"data":"`, replace the payload up to
+		// the closing quote. LastIndex matters for the struct-shaped match, which
+		// also contains `"type":"image"` ahead of the data field.
+		const marker = `"data":"`
+		i := strings.LastIndex(m, marker)
+		if i < 0 {
+			return m
+		}
+		start := i + len(marker)
+		return m[:start] + `[image omitted ` + strconv.Itoa(len(m)-start-1) + ` bytes]"`
+	}
+	s = imageStructDataRE.ReplaceAllStringFunc(s, replaceData)
+	s = imageJSONDataRE.ReplaceAllStringFunc(s, replaceData)
+	return imageDataURIRE.ReplaceAllStringFunc(s, func(m string) string {
+		return "data:image/…;base64,[omitted " + strconv.Itoa(len(m)) + " bytes]"
+	})
+}
+
+func resolveBodyMode(mode func() string) string {
+	if mode != nil {
+		return mode()
+	}
+	if BodyMode != nil {
+		return BodyMode()
+	}
+	return "full"
+}
+
+func truncateRecordedBody(s string) string {
+	if len(s) <= maxErrorBodyBytes {
+		return s
+	}
+	cut := maxErrorBodyBytes
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "\n...[truncated]"
+}
 
 type taskIDContextKey struct{}
 type workerContextKey struct{}
@@ -73,17 +165,22 @@ type Recorder struct {
 	thinkingType    string
 	reasoningEffort string
 	enabled         func() bool // reports whether recording is currently on; nil = always record
+	bodyMode        func() string
 }
 
 // Wrap returns a Provider that records calls to pg when enabled() reports true.
 // profName is the LLM profile name (e.g. "default"); may be empty. thinkingType /
 // reasoningEffort are the config-level thinking params actually sent to the API
 // (empty = not sent). A nil enabled predicate records unconditionally.
-func Wrap(inner llm.Provider, pg *db.DB, model, profName, thinkingType, reasoningEffort string, enabled func() bool) *Recorder {
-	return &Recorder{
+func Wrap(inner llm.Provider, pg *db.DB, model, profName, thinkingType, reasoningEffort string, enabled func() bool, bodyMode ...func() string) *Recorder {
+	rec := &Recorder{
 		inner: inner, pg: pg, model: model, prof: profName,
 		thinkingType: thinkingType, reasoningEffort: reasoningEffort, enabled: enabled,
 	}
+	if len(bodyMode) > 0 {
+		rec.bodyMode = bodyMode[0]
+	}
+	return rec
 }
 
 // parseSession extracts task id, worker role and intent id from session strings:
@@ -173,8 +270,8 @@ func (r *Recorder) Stream(ctx context.Context, req llm.CompletionRequest) iter.S
 			if err != nil {
 				status = "error"
 			}
-		// Lightweight metering row — always written.
-		r.recordUsage(taskID, expID, worker, intentID, usage, int(time.Since(start).Milliseconds()), status)
+			// Lightweight metering row — always written.
+			r.recordUsage(taskID, expID, worker, intentID, usage, int(time.Since(start).Milliseconds()), status)
 			// Heavy trace row — only when body recording is on.
 			if recordBodies {
 				r.record(req, session, taskID, worker, reqBody, capt, start, textBuf.String(), thinkingBuf.String(), usage, stopReason, err)
@@ -334,6 +431,8 @@ func (r *Recorder) record(req llm.CompletionRequest, session, taskID, worker, re
 	}
 	model = r.model
 
+	reqOut, respOut, rawReq, rawResp := applyBodyMode(resolveBodyMode(r.bodyMode), status, reqBody, string(respBody), capt.RawRequest(), capt.RawResponse())
+
 	rec := &db.LLMRecord{
 		SessionID:    session,
 		TaskID:       taskID,
@@ -347,13 +446,13 @@ func (r *Recorder) record(req llm.CompletionRequest, session, taskID, worker, re
 		CacheWrite:   usage.CacheWriteTokens,
 		Status:       status,
 		Error:        errMsg,
-		RequestBody:  reqBody,
-		ResponseBody: string(respBody),
+		RequestBody:  reqOut,
+		ResponseBody: respOut,
 		// Raw wire bodies; empty when the transport did not fill the Capture
 		// (e.g. a provider dialing through a client without the capture hook, or
 		// a call that failed before any HTTP request went out).
-		RawRequest:  capt.RawRequest(),
-		RawResponse: capt.RawResponse(),
+		RawRequest:  rawReq,
+		RawResponse: rawResp,
 	}
 
 	if err := r.pg.InsertLLMRecord(rec); err != nil {

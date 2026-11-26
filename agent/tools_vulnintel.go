@@ -9,6 +9,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/url"
 	"os/exec"
@@ -21,6 +22,7 @@ import (
 
 	actool "github.com/Autumn-27/norma/tool"
 
+	"github.com/chu0119/pojun/resource"
 	"github.com/chu0119/pojun/selfupdate"
 	"github.com/chu0119/pojun/vulnintel"
 )
@@ -84,7 +86,8 @@ func (t *ToolSet) searchVulns() actool.CoreTool {
 		"search_vulns",
 		"按组件名检索【公开已知漏洞】库（NVD + GitHub Advisory Database + CISA KEV 在野利用清单）。"+
 			"识别出目标组件（Web 中间件/框架/服务/固件等）后先查这里：有 KEV 标记=已在野利用、优先考虑；"+
-			"结果里的 cvss_score 与 severity 用于排优先级。\n"+
+			"结果里的 cvss_score 与 severity 用于排优先级，epss 是 30 天内被利用的概率（0–1，越高越值得打）。"+
+			"默认排序：KEV > EPSS > 版本区间命中 > CVSS。\n"+
 			"给 version 参数可做版本判定：\n"+
 			"  - version_in_range=true → 目标版本**落在受影响区间内**（该打）\n"+
 			"  - version_in_range=false → 目标版本**不在**受影响区间（通常不用打）\n"+
@@ -321,6 +324,9 @@ func (t *ToolSet) nucleiScanArgs(target, cveID, severity string) vulnintel.ScanA
 		Severity:     severity,
 		TimeoutTotal: 10 * time.Minute,
 		Proxy:        t.egressProxy,
+		// 资源自适应（默认关闭）：容量小按计划降速；未启用时为 0，不添加
+		// -rate-limit，命令与升级前一致。150 是 nuclei 的常见默认量级。
+		RateLimit: resource.NucleiRateLimit(150),
 	}
 }
 
@@ -394,12 +400,16 @@ func (t *ToolSet) scanWithNuclei() actool.CoreTool {
 			if a.Severity != "" && !nucleiSeverityRE.MatchString(strings.TrimSpace(a.Severity)) {
 				return actool.Errorf("severity 只允许 critical/high/medium/low/info 的逗号组合"), nil
 			}
-			run, err := nucleiBashCommand(nucleiTemplatesDir, t.nucleiScanArgs(a.Target, a.CVEID, a.Severity))
+			args := t.nucleiScanArgs(a.Target, a.CVEID, a.Severity)
+			run, err := nucleiBashCommand(nucleiTemplatesDir, args)
 			if err != nil {
 				return actool.Errorf("组装扫描命令失败: " + err.Error()), nil
 			}
 			note := "用 Bash 工具执行上面这条命令(默认 10 分钟超时,超时会截断输出);" +
 				"输出为 JSONL,每行一个模板命中;空输出=无命中。发现真实漏洞后走 report_finding 走正常上报。"
+			if args.RateLimit > 0 {
+				note = fmt.Sprintf("资源自适应已按当前机器容量限速 %d req/s（设置页可调/关闭）。", args.RateLimit) + note
+			}
 			if pre := nucleiEgressNote(t.egressProxy); pre != "" {
 				note = pre + " " + note
 			}

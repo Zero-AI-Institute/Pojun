@@ -2,6 +2,138 @@
 
 本项目的重要变更记录在此文件中，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [0.4.123] - 2026-11-26
+### 能力：资源自适应（opt-in，内部版 v0.9.73 下放）
+
+- **默认零变化**：`resource_auto_tune` 缺省 `false`。未开启时只做只读容量探测与展示，
+  worker 仍按现有 `workers` 设置或默认 3，不限制作业、不缩放扫描、不修改 Go 运行时；
+  没有数据库迁移，升级不会改变存量部署行为。
+- **容量探测**：CPU/内存/负载/cgroup v1+v2/数据目录磁盘；容器内取 `memory.max` /
+  `cpu.max`（或 v1 对应文件）限额，失败只降级对应维度并给出可操作警告，不阻断启动。
+- **计划推导**：按 CPU/内存分档推导 worker（2–8）、任务并发建议、后台作业全局/单任务
+  上限、扫描速率（0.3–1×）、GOMEMLIMIT、GOMAXPROCS、hashcat/john 低负载参数；
+  每小时自动重算，扩容/限额调整无需重启。
+- **显式配置优先**：库里已有 `workers` 永远优先；只有从未配置且用户开启自动调优时才用
+  计划值；手工覆盖 worker 会显式写穿 `workers` 设置，不静默改写存量配置。
+- **作业闸门**：`job_start` 全局/单任务上限排队（10 分钟超时给可行动错误）；计划启用且
+  Linux 有 GNU 工具时自动 `nice -n 10` 与内层 `timeout --foreground --kill-after`，
+  超时仍写回退出码。计划未启用时命令行逐字节不变。
+- **扫描缩放**：计划缩放 <1 时 `scan_with_nuclei` 自动加 `-rate-limit`；Bash 描述追加
+  nuclei/ffuf/hashcat/john 低负载参数建议（公开版无 opsec 命令重写层，不做命令级强制）。
+- **设置页「资源自适应」卡片**：容量/计划/依据/生效值、自动/手动、阈值、4 项手工覆盖、
+  保存并应用、重新探测、一键应用推荐任务并发；新增
+  `GET/PUT /api/resource`、`POST /api/resource/retune`。
+- **部署护栏**：`install.sh` 按内存 65%/80%、CPU 80% 写 systemd
+  `MemoryHigh/MemoryMax/CPUQuota/TasksMax`（`POJUN_*` 覆盖，`POJUN_RESOURCE_LIMITS=0`
+  关闭，非法值直接报错）；新增 `scripts/apply-systemd-limits.sh [--dry-run|--disable]`
+  给存量部署补 drop-in；Docker 只按 cgroup 配额缩放、不改宿主。
+- **测试**：cgroup v1/v2、计划档位、手工覆盖、作业闸门、扫描缩放、API 往返/校验、
+  install/apply 脚参数归一、前端纯函数与静态构建。文档见 `docs/资源自适应.md`。
+
+### 能力：内置 HTTPS 与证书管理（opt-in，内部版 v0.9.78 下放）
+
+- **默认不启用 HTTPS**：`tls_mode` 缺省为 `off`，新装与存量升级都不自动切换、不写迁移
+  标记、不生成证书；需要时在设置页显式启用（自签一键 / 导入 / ACME），不存在因 301
+  或证书信任打断 Docker Desktop、非同机反代等现有部署的问题。
+- **同端口 TLS/明文共存**：启用后 `tlsmgr.SniffListener` 按首字节分流，HTTPS 与 HTTP
+  共用 `:8787`；远程明文 301 到 HTTPS（带 Host 白名单，防开放重定向），本机回环明文
+  直通（兼容同机 nginx 回源与健康检查）；HTTP/2、证书热加载、慢连接不阻塞 Accept。
+- **证书模式**：自签（本地 CA + 叶子，自动收集主机名/回环/网卡 IP，SAN 变化自动轮换）、
+  导入 PEM（证书链 + 未加密私钥，校验匹配/有效期/大小/CA 误传/serverAuth）、
+  Let's Encrypt ACME（HTTP-01 / TLS-ALPN-01，IP 证书 shortlived，按寿命一半续期）。
+- **ACME 兜底**：无证书先自签起服务、后台申请；失败保留旧证书并在设置页显示原因；
+  申请/续期可取消，重启前会拒绝正在进行的申请。
+- **hostd 防火墙临时租约**：只在 80/443 原本未放行时临时放行，申请结束/超时撤销；
+  租约落盘、hostd 重启接管未过期租约并撤销过期/非法端口项；ufw/firewalld。
+  hostd 单元新增 `CAP_NET_ADMIN`、`AF_NETLINK`、`StateDirectory`（需重跑 install.sh）。
+- **显式启用与逃生阀**：设置页 off 状态提供「启用 HTTPS（自签）」按钮，另有导入 /
+  ACME 显式路径；`-tls=off|selfsigned|import|acme` 只覆盖本次进程、不写库，供反代/
+  容器场景临时回退。
+- **设置页「HTTPS 与证书」卡片**：状态/SAN/到期、CA 下载、模式切换、导入、ACME
+  （staging/挑战方式）、HSTS 开关、防火墙状态、重启生效、监听地址与访问 URL。
+- **HSTS**：仅在 TLS 终止且设置页开启时下发；off/自签默认关闭，避免浏览器锁死。
+
+### 任务删除异步清理队列与流量/LLM 留存治理（内部版 v0.9.79–v0.9.82 下放）
+
+- **异步清理队列**：任务删除的 PostgreSQL 事务只删除任务行并写入 `cleanup_jobs`
+  （`traffic` / `llm` / `files`），秒级提交；后台单通道 worker 分批删除流量索引、
+  LLM 审计与暂存文件。进程重启后自动续跑，失败 3 次转 `failed` 并可由
+  `POST /api/cleanup/jobs/{id}/retry` 重试；`GET /api/cleanup/jobs?active=1`
+  给前端“后台清理”横幅。
+- **保留公开版可回滚语义**：任务工作区/转录先 rename 到 `.delete-staging` 并写
+  journal，PostgreSQL 失败时回滚恢复；启动时按任务行是否存在决定“恢复”还是
+  “继续删除”。流量清理带删除请求时刻 cutoff，绝不删除请求之后新录的流量。
+- **批量删流量**：host 集合收敛到 SQLite TEMP 表，每批 2000 行独立事务；每 20 批
+  用 PostgreSQL 复核跨任务 host 归属，被新任务接管的 host 移出删除集；批间
+  PASSIVE checkpoint，结束 TRUNCATE WAL，避免长事务与 WAL 膨胀。
+- **流量三段式留存**：`traffic_mode=off|evidence|full`（存量 bool 升级为
+  off/full，默认仍为 off）；evidence 模式只清理未绑定证据的流量
+  （`traffic_evidence_window_hours` / `traffic_evidence_max_gb`，默认 24h/2GB），
+  证据入库写 `evidence_pins`，PostgreSQL 保护集每次巡检前回填，读取失败即中止。
+- **LLM 审计留存**：`storage_llm_keep_days` / `storage_llm_max_rows`（默认 0=关闭），
+  按批删除并补 `idx_llm_records_task` 索引；存储巡检清理已删任务的孤儿审计行。
+- **存储巡检**：24 小时保护窗口下清理数据库行已不存在的任务目录、会话目录与
+  转录文件，路径严格限制在 data 目录内。
+- **测试**：cleanup job 状态机/续跑/重试上限、跨任务 host 复核、cutoff 与保护集、
+  证据 pin、LLM 留存、路径越界拒绝、前端构建。
+
+### 安全与稳定性：内部版 v0.9.68–v0.9.95 首批下放
+
+- **跨任务经验隔离**：`playbooks` 唯一键改为 `(key, root_domain, task_id)`，检索限定本任务；
+  同簇端点/同技术栈变体候选与 `search_experience` 同样按 `assets.task_ids` 过滤，避免
+  A 任务的成功链/证据摘录被 B 任务注入。历史 `task_id IS NULL` 行归 0（不再匹配真实任务），
+  需要保留时可按 `finding_id` 回填。
+- **证据事务与流量 WAL**：`evidence.Record/Bind` 把流量正文准备移出 PG 事务；SQLite DSN
+  增加 `journal_size_limit=512MB`/`wal_autocheckpoint=1000`；reclaim 单步 60s、WAL TRUNCATE
+  10s 超时并处理 busy，避免 `idle in transaction` 与 WAL 无界增长。
+- **归档保留终态经验**：任务归档快照/恢复纳入 `intent_reflections`，恢复不再因外键级联
+  静默清空经验层。
+- **依赖安全**：Go 1.26.11、`klauspost/compress` 1.20.2、Next 16.4.6、zod 4.6.7；
+  `shadcn` 移到 devDependencies（运行期不需要）。
+- **确定性修复**：eval 排除 duplicate/已合并 finding、token 逐列 COALESCE；覆盖率
+  `top_gaps` 进入摘要；`budget_warn` 原样送达 planner；MCP 缓存落库失败不再计健康失败、
+  启动自检 90s；Windows 暂存目录删除有界重试；`pojun-maint` 支持 `database.dsn`。
+- **新增 `threat-modeling` skill**：任务早期资产/信任边界/滥用场景/优先级→意图。
+
+### 能力：白盒审计、出货前 Triage 与 MCP 工具指纹（内部版 v0.9.86）
+
+- **白盒审计五件套**：`repo_map`（语言/依赖/框架/入口/路由/信任边界/密钥热点）、
+  `taint_spec`（把 sources/sinks/sanitizers 确定性渲染成 Semgrep taint 规则）、
+  `sast_scan`（无 shell 跑 semgrep，按规则/严重度分组，原文落盘）、
+  `code_trace`（静态调用链，标注 source 命中）、`patch_variants`（从 unified diff
+  删除行找复制粘贴/同函数调用点）。路径锁在 `tasks/<id>/`，有文件数/大小/输出上限；
+  静态命中只算候选，必须动态复现才 `report_finding`。
+- **`triage_finding`**：planner/main 可用的确定性出货前体检（证据/verification/
+  流量/重复/归属），输出 pass/review/needs_evidence/duplicate，只提示不阻断。
+- **MCP 工具描述指纹**：`mcp_servers` 增加 `tools_hash/tools_hash_at/tools_changed/
+  tools_suspicious`；发现后按排序 name+description 算 SHA-256，变化/疑似注入在
+  MCP 页告警，不自动禁用（避免打断运行中任务）。
+
+### 修复：写工具 RawInput、暂停预算与 KEV 检索
+
+- `report_finding`/`record_fact` 启用 SDK `RawInput`，并让 guarded/untrusted/traced/
+  overridden 包装层透传 `AcceptsRawInput`——`normalizeToolInput` 的参数容错此前
+  永远跑不到（schema 校验先拒绝）。
+- `tasks.paused_total_seconds` 累计暂停时长；分钟预算改为“首次运行至今 − 累计暂停 −
+  当前暂停”，暂停很久再恢复不再瞬间超预算收尾。
+- KEV 条目补最小 `vuln_cpe_products` 行，`search_vulns` 不再因 INNER JOIN 隐藏
+  “只有 KEV、NVD 未补到”的 CVE；`SaveSyncState` 的页级进度不再把 `last_sync_at`
+  刷成 now（中断不会伪装成刚成功）。
+- **LLM 审计正文策略**：`llm_record_body_mode` 支持 `off/errors/full`，默认 `errors`
+  （成功调用只记元数据，失败调用正文单段截断 64KiB），录制页可直接切换。
+- **任务 Playbook v4**：新增 API/Java/云 K8s/代码审计/支付逻辑/前端供应链/网络设备/
+  AI LLM/数据取证/SRC 验收等模板，独立 flag `task_playbooks_v4`，不复活用户改过的同名模板。
+
+## [0.4.122] - 2026-11-26
+### 修复：终态经验落库 UTF-8 截断（#75）
+
+- `buildReflectionLesson` / `shortReflectionReason` / `firstLineText` 原先按字节
+  `s[:N]` 截断，中文/emoji 落在多字节中间时生成非法 UTF-8，PostgreSQL 报
+  `invalid byte sequence for encoding "UTF8"`（SQLSTATE 22021），导致终态经验写入失败。
+- 改为按 UTF-8 rune 边界截断；`terminal_reason/hypothesis/success_criteria/summary/lesson`
+  入库前统一 `strings.ToValidUTF8` 兜底；新增中文/emoji 边界与非法字节回归测试。
+- Windows `start.bat` 改为 Docker Desktop 启动器（#73），不再引用旧的 `artex.exe`。
+
 ## [0.4.121] - 2026-11-25
 ### 新增：LLM 配置独立提示词与 Agent 装配链只读视图
 

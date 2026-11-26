@@ -27,6 +27,7 @@ import (
 	"github.com/Autumn-27/norma/skill"
 	"github.com/chu0119/pojun/agent"
 	"github.com/chu0119/pojun/db"
+	"github.com/chu0119/pojun/llmpresets"
 )
 
 // validSkillName checks the agentskills.io name constraints, widened so a skill can
@@ -1872,6 +1873,9 @@ func (s *Server) pgSaveProfile(w http.ResponseWriter, r *http.Request) {
 		db.LLMProfile
 		APIKey    string `json:"api_key"`
 		Streaming *bool  `json:"streaming"`
+		// 视觉三态影子指针：缺省=保留原值；""=自动；on/off=写入。旧客户端/旧
+		// web bundle 不发送该字段时，不能把它悄悄重置成「自动」。
+		VisionMode *string `json:"vision_mode"`
 		// 独立提示词三态影子指针：缺省=保留原值；""=清空；文本=写入。
 		// 沿用 Streaming *bool 的先例，避免旧客户端/旧 web bundle 一保存就清空长文。
 		Prompt               *string `json:"prompt"`
@@ -1885,6 +1889,21 @@ func (s *Server) pgSaveProfile(w http.ResponseWriter, r *http.Request) {
 	p := body.LLMProfile
 	p.APIKey = body.APIKey
 	p.Streaming = body.Streaming == nil || *body.Streaming
+	// 视觉三态：显式携带则采用（含 ""=自动）；缺省则读旧值保留。读取失败拒绝
+	// 保存，避免把用户的 on/off 静默覆盖成自动。
+	switch {
+	case body.VisionMode != nil:
+		p.VisionMode = *body.VisionMode
+	case p.ID != 0:
+		old, err := pg.ProfileByID(p.ID)
+		if err != nil || old == nil {
+			writeErr(w, 500, "读取原有视觉设置失败，已拒绝保存以免覆盖")
+			return
+		}
+		p.VisionMode = old.VisionMode
+	default:
+		p.VisionMode = ""
+	}
 	// format 受 DB CHECK 约束（openai/anthropic/openai-responses）。非法值在
 	// 这里就挡掉，否则会以 500 + SQLSTATE 23514 的形式甩给用户，前端只能显示
 	// 「服务器内部错误」，看不出是自己填错了。
@@ -1900,6 +1919,37 @@ func (s *Server) pgSaveProfile(w http.ResponseWriter, r *http.Request) {
 	}
 	if p.Format != "openai" || p.MaxTokensField != llm.MaxTokensFieldCompletion {
 		p.MaxTokensField = ""
+	}
+	// Base URL 按协议收敛：完整端点去掉后缀、openai 缺版本段补 /v1、anthropic
+	// 去多余 /v1。只确定的部分自动改，落库后测试/运行与用户看到的一致。
+	norm := llmpresets.NormalizeBaseURL(p.Format, p.BaseURL)
+	if norm.Changed {
+		p.BaseURL = norm.Normalized
+	}
+	// 模型参数自动补全：只对**新建**配置填默认值，且只填空值。更新时一律保留
+	// 原值——旧客户端的空串可能代表「用户显式选了协议默认字段名」，服务端没有
+	// touched 信息，替用户改掉就成了「覆盖手改」。编辑路径的补全由前端在选模型
+	// 时按 /api/llm/model-meta 做，用户可亲眼看到并改回。
+	if p.ID == 0 {
+		defaults := llmpresets.LookupModelDefaults(p.Model, p.Format)
+		if p.ContextWindowK <= 0 && defaults.ContextK > 0 {
+			p.ContextWindowK = defaults.ContextK
+		}
+		if p.MaxTokens == 0 && defaults.MaxTokens > 0 {
+			p.MaxTokens = defaults.MaxTokens
+		}
+		if p.Format == "openai" && p.MaxTokensField == "" && defaults.MaxTokensField != "" {
+			p.MaxTokensField = defaults.MaxTokensField
+		}
+	}
+	// 视觉三态只接受 ''/on/off（DB CHECK 同样约束）；非法值在这里挡掉，别把
+	// SQLSTATE 23514 变成 500。
+	p.VisionMode = strings.ToLower(strings.TrimSpace(p.VisionMode))
+	switch p.VisionMode {
+	case "", "on", "off":
+	default:
+		writeErr(w, 400, "vision_mode 只能是空（自动）、on 或 off")
+		return
 	}
 	// User-Agent 是单行 HTTP 头值：含 CR/LF 会被 Go transport 拒绝（也是 header
 	// injection 的形状），在这里直接挡掉并给明确报错，别等运行时每个请求都失败。
@@ -1941,7 +1991,17 @@ func (s *Server) pgSaveProfile(w http.ResponseWriter, r *http.Request) {
 	// profile's key/model/priority/pool_exclude edit reshapes the chain, so the
 	// engine's provider has to be rebuilt either way.
 	s.reapplyActiveProfile()
-	writeJSON(w, 200, map[string]any{"id": id})
+	// 视觉自动探测：配置指纹变化（或从没测过）才在后台补测一次并落库；同配置
+	// 再次保存不消耗任何 token。用户显式选了支持/不支持时由调度器自行跳过。
+	s.scheduleVisionProbe(id)
+	resp := map[string]any{"id": id}
+	if norm.Changed {
+		// 把归一后的地址带回前端，避免输入框仍显示旧值、用户以为没生效。
+		resp["base_url"] = p.BaseURL
+		resp["normalized"] = true
+		resp["note"] = norm.Note
+	}
+	writeJSON(w, 200, resp)
 }
 
 // pgGetLLMRetryPolicy 返回全局重试策略(五层各自的次数+间隔)。未配置过 → 全零，

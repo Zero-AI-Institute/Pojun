@@ -734,6 +734,8 @@ func (t *ToolSet) WorkerTools() []actool.CoreTool {
 		t.searchVulns(), t.getVuln(), t.getPoc(), t.scanWithNuclei(), t.netContext(),
 		// search_experience（v0.4.103）：按关键词/维度查本任务终态经验与跨任务成功 playbook。
 		t.searchExperience(),
+		// kb_search / kb_get / kb_mark_used：跨任务实战知识库（内置/人工采纳的条目）。
+		t.kbSearch(), t.kbGet(), t.kbMarkUsed(),
 		// listener_*：回连接收器（红队 C2 前置）——start/stop 走 ask 审批，sessions 只读。
 		t.listenerStart(), t.listenerStop(), t.listenerSessions(),
 		// http_probe（v0.4.27）：批量探活领域工具——替代逐条手写 curl（任务 5 实测
@@ -745,6 +747,11 @@ func (t *ToolSet) WorkerTools() []actool.CoreTool {
 		// miniapp_audit（v0.4.99）：微信小程序解包产物目录审计——接口/密钥/云环境/
 		// 签名候选/路由/sourceMap/OSV。与 js_audit 共用内嵌 Python 的 --dir 分支。
 		t.miniappAudit(),
+		// 白盒审计五件套（v0.9.86）：源码在任务目录内时先 map 再定规则，
+		// sast_scan 只跑 semgrep（无 shell），code_trace/patch_variants 做静态线索。
+		t.repoMap(), t.taintSpec(), t.sastScan(), t.codeTrace(), t.patchVariants(),
+		// view_image：视觉模型下把截图/验证码真正交给模型看；非视觉配置给可操作错误。
+		t.viewImage(),
 		// auth_request：用资产上已登记的凭据组装带认证的请求（横向/越权验证的前提）。
 		t.authRequest(),
 		// evidence_check（v0.4.71）：复核高/危漏洞证据是否足以支撑危害结论（13 项检查 + src_ready）。
@@ -800,12 +807,19 @@ func (t *ToolSet) MainAgentTools() []actool.CoreTool {
 		t.addTaskScope(),
 		// list_untested_assets：按需查本任务范围内未测资产(类型+分页)，自行决定补测。
 		t.listUntestedAssets(),
+		// 出货前体检（v0.9.86）：planner/main 可用，worker 不给。
+		t.triageFindingTool(),
 		// search_vulns / get_vuln：人在环路上也可直接查公开已知漏洞情报。
 		t.searchVulns(), t.getVuln(), t.getPoc(), t.scanWithNuclei(), t.netContext(),
 		// http_probe（v0.4.27）：批量探活领域工具（mainagent 与 worker 同款）。
 		t.httpProbe(),
 		// js_audit（v0.4.59）：SPA/webpack 源码泄露审计（mainagent 与 worker 同款）。
 		t.jsAudit(),
+		// 白盒审计五件套（v0.9.86）：源码在任务目录内时先 map 再定规则，
+		// sast_scan 只跑 semgrep（无 shell），code_trace/patch_variants 做静态线索。
+		t.repoMap(), t.taintSpec(), t.sastScan(), t.codeTrace(), t.patchVariants(),
+		// view_image：主 Agent 也可直接看任务内的截图与验证码（非视觉配置给可操作错误）。
+		t.viewImage(),
 		// listener_*：回连接收器（红队 C2 前置）——start/stop 走 ask 审批，sessions 只读。
 		t.listenerStart(), t.listenerStop(), t.listenerSessions(),
 		// auth_request：用资产上已登记的凭据组装带认证的请求（横向/越权验证的前提）。
@@ -818,6 +832,8 @@ func (t *ToolSet) MainAgentTools() []actool.CoreTool {
 		t.searchRecentCritical(),
 		// search_experience（v0.4.103）：按需检索终态经验与跨任务 playbook。
 		t.searchExperience(),
+		// kb_search / kb_get / kb_mark_used：跨任务实战知识库（内置/人工采纳的条目）。
+		t.kbSearch(), t.kbGet(), t.kbMarkUsed(),
 	}
 }
 

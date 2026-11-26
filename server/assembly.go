@@ -339,11 +339,14 @@ func wireTools(pg *db.DB, domainReg map[string]actool.CoreTool) {
 		}
 		return rootDomain, simhash, techs, url, assetID, true
 	}
-	agent.SimilarEndpointsFn = func(rootDomain string, simhash int64, excludeID int64, limit int) ([]db.Asset, error) {
-		return pg.SimilarHTTPEndpoints(rootDomain, simhash, excludeID, limit)
+	agent.SimilarEndpointsFn = func(taskID int64, rootDomain string, simhash int64, excludeID int64, limit int) ([]db.Asset, error) {
+		return pg.SimilarHTTPEndpoints(taskID, rootDomain, simhash, excludeID, limit)
 	}
-	agent.MatchPlaybooksFn = func(vulnClass string, techs []string, rootDomain string, limit int) []db.Playbook {
-		return pg.MatchPlaybooks(vulnClass, techs, rootDomain, limit)
+	agent.SimilarTechEndpointsFn = func(taskID int64, techs []string, excludeID int64, limit int) ([]db.Asset, error) {
+		return pg.SimilarTechEndpoints(taskID, techs, excludeID, limit)
+	}
+	agent.MatchPlaybooksFn = func(taskID int64, vulnClass string, techs []string, rootDomain string, limit int) []db.Playbook {
+		return pg.MatchPlaybooks(taskID, vulnClass, techs, rootDomain, limit)
 	}
 	agent.TaskRootAndTechsFn = func(taskID int64) (string, []string) {
 		var rootDomain string
@@ -504,6 +507,8 @@ func wireTools(pg *db.DB, domainReg map[string]actool.CoreTool) {
 		var bashNote string
 		if localExec {
 			bashNote = agent.EnvCapabilityNote()
+			// 资源自适应未启用时返回空串，Bash 描述与升级前一致。
+			bashNote += agent.ResourceCapabilityNote()
 			if len(shellHints) > 0 {
 				bashNote += "\n\n以下工具已安装在此 bash 环境中，可直接通过 Bash 调用：\n" + strings.Join(shellHints, "\n")
 			}

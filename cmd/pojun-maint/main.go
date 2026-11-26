@@ -44,7 +44,7 @@ const (
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: pojun-maint <scan-artifacts|previews|reset-prompts|fix-permissions|scope-audit|idscan|bench> --config <config.json> [--force] [--out file]")
+		fmt.Fprintln(os.Stderr, "usage: pojun-maint <scan-artifacts|previews|reset-prompts|fix-permissions|scope-audit|idscan|bench|library> --config <config.json> [--force] [--out file]")
 		os.Exit(2)
 	}
 	cmd := os.Args[1]
@@ -52,6 +52,11 @@ func main() {
 	// flag set (whose ExitOnError would reject --db/--tiers/--task-map with exit 2).
 	if cmd == "idscan" {
 		runIDScan(os.Args[2:])
+		return
+	}
+	// library 的子命令各有自己的 flag 集，且 lint 不需要数据库。
+	if cmd == "library" {
+		runLibrary(os.Args[2:])
 		return
 	}
 	// bench 也是独立 flag 集：score/compare/validate 各有自己的参数，不能和
@@ -168,6 +173,7 @@ func loadDSN(path string) (string, error) {
 	}
 	var c struct {
 		Database struct {
+			DSN      string `json:"dsn"`
 			Host     string `json:"host"`
 			Port     int    `json:"port"`
 			User     string `json:"user"`
@@ -180,6 +186,10 @@ func loadDSN(path string) (string, error) {
 		return "", err
 	}
 	d := c.Database
+	// 与 config.PostgresDSN 保持一致：允许 install.sh 之外的发行方式直接写 dsn。
+	if strings.TrimSpace(d.DSN) != "" {
+		return strings.TrimSpace(d.DSN), nil
+	}
 	if d.Host == "" || d.User == "" || d.DBName == "" {
 		return "", fmt.Errorf("config.json 缺少 database 配置")
 	}

@@ -35,6 +35,7 @@ import (
 	"github.com/chu0119/pojun/llmrec"
 	"github.com/chu0119/pojun/report"
 	"github.com/chu0119/pojun/telemetry"
+	"github.com/chu0119/pojun/tlsmgr"
 	"github.com/chu0119/pojun/traffic"
 	"github.com/chu0119/pojun/vault"
 )
@@ -59,6 +60,9 @@ type Server struct {
 	// 30s TTL 从 settings 刷新；首次使用时惰性初始化。
 	revokeCache     *revocationCache
 	revokeCacheOnce sync.Once
+	// visionProbing 去重同一配置的自动视觉探测：连点保存/多标签页同时保存时，
+	// 只发一次图片请求。key=profile id，value 为空占位。
+	visionProbing sync.Map
 
 	// 文档预览（v0.4.21）：Office/PDF 取样转图片，单 worker 串行（LibreOffice
 	// 的 UserInstallation 不能并发），queue 只放 artifact id。
@@ -70,6 +74,12 @@ type Server struct {
 	// lm is the process-wide callback listener. It is initialized lazily so an
 	// installation that never needs a callback opens no extra socket or goroutine.
 	listenOnce sync.Once
+	// baseGOMAXPROCS 是进程启动时 Go 运行时的 P 数（Go 1.25+ 默认按 cgroup
+	// 配额计算）。关闭资源自适应时恢复到它，而不是硬写 runtime.NumCPU。
+	baseGOMAXPROCS int
+	// baseMemLimit 是进程启动时的 Go 堆上限（含 GOMEMLIMIT 环境变量）。关闭
+	// 资源自适应时恢复它，不能一律写成 MaxInt64——那会悄悄吃掉用户的 GOMEMLIMIT。
+	baseMemLimit int64
 	// listeners 是红队回连接收器管理器（listener 包）：接住反弹 shell/OOB 回连
 	// 并留证。绑定端口无需特权（1024+），不经 hostd。
 	listeners *listener.Manager
@@ -158,6 +168,14 @@ type Server struct {
 	archiveWake chan struct{}
 	archiveWG   sync.WaitGroup
 	side        *sideQuestionState
+
+	// 内置 HTTPS 与证书管理：证书管理器、当前是否以 TLS 监听、ACME 取消句柄。
+	tlsMgr         *tlsmgr.Manager
+	tlsActive      atomic.Bool
+	tlsRuntimeAddr atomic.Value // string：当前进程实际监听的地址
+	tlsAddrSaved   atomic.Bool  // 设置表里是否有 tls_https_addr（有则优先于 -addr）
+	tlsMu          sync.Mutex
+	tlsCancel      context.CancelFunc
 }
 
 // provEntry is a cached provider + its config for one LLM profile id.
@@ -207,6 +225,11 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		provByProfile:  map[provKey]*provEntry{}, llmHealth: newLLMHealthRegistry(m.pg),
 		taskAgents: map[string]*taskAgentBundle{}, archiveWake: make(chan struct{}, 1)}
 	s.jwtKey.Store(key)
+	// 资源自适应在设置页开启时可能修改 GOMAXPROCS/GOMEMLIMIT；先记下进程
+	// 启动值（Go 1.25+ 默认按 cgroup 配额算），关闭时才能原样恢复。
+	s.captureBaseRuntime()
+	// 证书管理器必须早于路由注册：设置页与监听都依赖它。失败只记录，不阻塞启动。
+	s.initTLS()
 	llmpresets.InitCache(dataDir) // 厂商模型元数据缓存（7 天 TTL，失败静默用内嵌快照）
 	s.listeners = listener.NewManager()
 	agent.SetListenerManager(s.listeners)
@@ -299,6 +322,22 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		}
 		wireAgentAugment(m.pg, s.skillDir, s.hostTools)        // 可见 skills/MCP + 流量/编排 host 工具装配进 agent 工具集
 		agent.SetCweSkillIndex(BuildCweSkillIndex(s.skillDir)) // CWE→方法论 skill 联动（漏洞情报工具输出 related_skills）
+		// 知识库：检索/采纳工具共享同一 store；内容包按 id+version 幂等播种。
+		// 单个包损坏只记日志、不阻断启动（skills 目录可由用户自行扩展）。
+		agent.SetKBStore(m.pg.KB())
+		if seeded, skipped, errs := m.pg.SeedKBPacks(s.skillDir); seeded > 0 || skipped > 0 || len(errs) > 0 {
+			log.Printf("[kb] 内容包播种：新增 %d、已存在跳过 %d、失败 %d", seeded, skipped, len(errs))
+			for _, err := range errs {
+				log.Printf("[kb] 内容包失败：%v", err)
+			}
+		}
+		// 存量行（v2 之前导入/同步）search_text 为空时在检索里不可见；异步回填。
+		go func() {
+			n, err := m.pg.KB().BackfillDerived(s.ctx)
+			if err != nil {
+				log.Printf("[kb] search_text 回填中断（已完成 %d 条）：%v", n, err)
+			}
+		}()
 		domainReg := buildDomainReg(m.Assets())
 		wireTools(m.pg, domainReg) // 内置工具表：按 agent 过滤 + 覆盖描述/schema + 注入默认值
 		seedPrompts(m.pg)          // 内置 agent 默认提示词正文播种进 agent_prompts(仅空时)
@@ -314,7 +353,9 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		// 漏洞 IM 推送投递引擎。与 Scheduler 并列但独立：推送的实时性要求(3s)
 		// 与触发器的业务节奏不同，且两者失败互不牵连——推送卡住不该影响 agent 触发。
 		go newNotifier(s).Run(s.ctx)
+		s.startCleanupWorker(s.ctx)
 		s.startTrafficRetentionWorker()
+		s.startVisionProbeBackfill() // 视觉探测缓存：启动 20s 后为存量配置补测一次
 		// Verify every enabled MCP at startup (connection + tools/list), recording
 		// last_ok/last_error/latency for the UI. Async so it never blocks startup.
 		go s.checkMCPHealthOnStartup()
@@ -336,6 +377,9 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	} else {
 		log.Printf("[engine] no LLM provider configured — engine idle until set via /api/llm or env")
 	}
+	// 资源自适应：读到数据库后按设置生成计划（默认关闭 = 只探测、不改变任何
+	// 运行时行为）。放在恢复任务运行时之前，保证恢复的任务看到的是最终 plan。
+	s.applyResourcePlan()
 	s.restoreTaskRuntimes()
 	go s.reconcileConcurrency()
 	s.startTaskArchiveWorker()
@@ -343,6 +387,8 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	// 主服务写不进去，只能由它自己换装——这里只负责发现版本不一致并通知。
 	s.StartHostdReconcile()
 	s.wireInterceptReviewer() // LLM 兜底审批:未命中拦截规则的命令交给模型判定
+	// 每小时重算一次，跟上扩容/容器限额调整；只重算计划，不写系统配置。
+	go s.resourceLoop(ctx)
 	return s
 }
 
@@ -434,6 +480,7 @@ func (s *Server) loadLLMConfig() (agent.Config, bool) {
 	cfg.MaxTokens, cfg.MaxTokensField = p.MaxTokens, p.MaxTokensField
 	cfg.SessionHeaderKey = p.SessionHeaderKey
 	cfg.UserAgent = p.UserAgent
+	cfg.Vision = profileVision(p)
 	s.applyProfileRetry(&cfg, p)
 	if cfg.APIKey == "" {
 		return cfg, false
@@ -460,6 +507,7 @@ func (s *Server) saveLLMConfig(cfg agent.Config) error {
 	var maxTokensField string
 	var sessionHeaderKey string
 	var userAgent string
+	var visionMode string
 	var retry db.RetryOverride
 	if profs, _ := s.m.pg.ListProfiles(); profs != nil {
 		for _, p := range profs {
@@ -468,6 +516,7 @@ func (s *Server) saveLLMConfig(cfg agent.Config) error {
 				maxTokens, maxTokensField = p.MaxTokens, p.MaxTokensField
 				sessionHeaderKey = p.SessionHeaderKey
 				userAgent = p.UserAgent
+				visionMode = p.VisionMode
 				retry = p.Retry
 				break
 			}
@@ -479,13 +528,18 @@ func (s *Server) saveLLMConfig(cfg agent.Config) error {
 		ContextWindowK: cfg.ContextWindowK, ThinkingType: cfg.ThinkingType, ReasoningEffort: cfg.ReasoningEffort, IsDefault: true,
 		Priority: priority, PoolExclude: poolExclude, Streaming: streaming,
 		MaxTokens: maxTokens, MaxTokensField: maxTokensField, SessionHeaderKey: sessionHeaderKey,
-		UserAgent: userAgent,
-		Retry:     retry,
+		UserAgent: userAgent, VisionMode: visionMode,
+		Retry: retry,
 	})
 	if err != nil {
 		return err
 	}
-	return s.m.pg.SetActiveProfile(newID)
+	if err := s.m.pg.SetActiveProfile(newID); err != nil {
+		return err
+	}
+	// legacy 端点同样触发自动视觉探测（仅当视觉仍是「自动」档）。
+	s.scheduleVisionProbe(newID)
+	return nil
 }
 
 // reapplyActiveProfile hot-reloads the engine from the active DB profile so that
@@ -548,7 +602,7 @@ func (s *Server) applyLLM(cfg agent.Config) error {
 		s.cfgMu.Lock()
 		profName := s.llmProf
 		s.cfgMu.Unlock()
-		prov = llmrec.Wrap(prov, s.m.PG(), cfg.Model, profName, cfg.ThinkingType, cfg.ReasoningEffort, s.m.LLMRecordEnabled)
+		prov = llmrec.Wrap(prov, s.m.PG(), cfg.Model, profName, cfg.ThinkingType, cfg.ReasoningEffort, s.m.LLMRecordEnabled, s.m.LLMRecordBodyMode)
 		prov = bindSideProvider(prov, cfg, 0, profName, "")
 	}
 	s.cfgMu.Lock()
@@ -574,6 +628,7 @@ func (s *Server) applyLLM(cfg agent.Config) error {
 	// chat agent serves MANY custom agents by key → it holds the GLOBAL opts
 	// (backend/key) and gates Enabled per-conversation-agent at Chat time. 对话始终用激活配置。
 	s.chatAgent = agent.NewChatAgent(prov, cfg.Model, s.m.dir, tx, win) // chat page runner
+	s.chatAgent.SetVision(func() bool { return cfg.Vision })
 	s.chatAgent.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
 	s.chatAgent.SetWebSearch(s.m.WebSearchOpts())
 	s.chatAgent.SetGuard(s.chatGuard())
@@ -618,6 +673,7 @@ func (s *Server) profileConfig(p *db.LLMProfile) (agent.Config, bool) {
 	cfg.MaxTokens, cfg.MaxTokensField = p.MaxTokens, p.MaxTokensField
 	cfg.SessionHeaderKey = p.SessionHeaderKey
 	cfg.UserAgent = p.UserAgent
+	cfg.Vision = profileVision(p)
 	s.applyProfileRetry(&cfg, p)
 	if cfg.APIKey == "" {
 		return cfg, false
@@ -736,7 +792,10 @@ func (s *Server) providerForProfileEffort(p *db.LLMProfile, effort, agentKey str
 	}
 	// Wrap with recorder, tagged with the effective effort so the LLM record shows
 	// what was actually sent (the profile value or an agent override).
-	prov = llmrec.Wrap(prov, s.m.PG(), cfg.Model, p.Name, cfg.ThinkingType, cfg.ReasoningEffort, s.m.LLMRecordEnabled)
+	prov = llmrec.Wrap(prov, s.m.PG(), cfg.Model, p.Name, cfg.ThinkingType, cfg.ReasoningEffort, s.m.LLMRecordEnabled, s.m.LLMRecordBodyMode)
+	// 视觉守卫再包一层（幂等）：让审计记录看到的是剥离/限量后的请求，而不是
+	// 带着 base64 的原请求（NewProvider 内层那次服务直连调用方）。
+	prov = agent.VisionGuard(prov, cfg.Vision)
 	prov = bindSideProvider(prov, cfg, p.ID, p.Name, agentKey)
 	s.provCacheMu.Lock()
 	if generation != s.provCacheGen {
@@ -770,6 +829,7 @@ func (s *Server) chatAgentForProfile(agentKey string, id int64) *agent.ChatAgent
 	}
 	tx := transcript.NewStore(filepath.Join(s.m.dir, "transcripts"))
 	ca := agent.NewChatAgent(s.poolForBinding(agentKey, id, prov, cfg), cfg.Model, s.m.dir, tx, cfg.CompactionWindow())
+	ca.SetVision(func() bool { return cfg.Vision })
 	ca.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
 	ca.SetWebSearch(s.m.WebSearchOpts())
 	ca.SetGuard(s.chatGuard())
@@ -831,6 +891,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/update/check", s.updateCheck)
 	mux.HandleFunc("POST /api/update/apply", s.updateApply)
 	mux.HandleFunc("POST /api/update/rollback", s.updateRollback)
+	mux.HandleFunc("POST /api/update/proxy-test", s.updateProxyTest)
 	mux.HandleFunc("GET /api/update/stream", s.updateStream)
 
 	mux.HandleFunc("GET /api/tasks", s.listTasks)
@@ -978,6 +1039,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/traffic/all", s.deleteAllTraffic)
 	mux.HandleFunc("GET /api/traffic/retention", s.getTrafficRetention)
 	mux.HandleFunc("POST /api/traffic/retention", s.runTrafficRetentionHandler)
+	mux.HandleFunc("GET /api/cleanup/jobs", s.listCleanupJobs)
+	mux.HandleFunc("POST /api/cleanup/jobs/{id}/retry", s.retryCleanupJob)
 	mux.HandleFunc("GET /api/traffic/exchange", s.getTrafficExchange)
 	mux.HandleFunc("GET /api/traffic/blob", s.getTrafficBlob)
 	mux.HandleFunc("GET /api/commands", s.pgListCommands)
@@ -991,6 +1054,19 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/diagnostics/export", s.handleDiagnosticsExport)
 	mux.HandleFunc("GET /api/settings", s.getSettings)
 	mux.HandleFunc("PUT /api/settings", s.putSettings)
+	// 资源自适应：容量/计划/依据、自动/手动、阈值与手工覆盖。
+	mux.HandleFunc("GET /api/resource", s.resourceGet)
+	mux.HandleFunc("PUT /api/resource", s.resourcePut)
+	mux.HandleFunc("POST /api/resource/retune", s.resourceRetune)
+	// 内置 HTTPS 与证书管理。
+	mux.HandleFunc("GET /api/tls/status", s.tlsStatus)
+	mux.HandleFunc("PUT /api/tls/settings", s.tlsSaveSettings)
+	mux.HandleFunc("POST /api/tls/import", s.tlsImport)
+	mux.HandleFunc("POST /api/tls/selfsigned", s.tlsSelfSigned)
+	mux.HandleFunc("POST /api/tls/acme", s.tlsACMECreate)
+	mux.HandleFunc("POST /api/tls/acme/cancel", s.tlsACMECancel)
+	mux.HandleFunc("GET /api/tls/ca.pem", s.tlsCA)
+	mux.HandleFunc("POST /api/tls/restart", s.tlsRestart)
 	// 漏洞 IM 推送。渠道是「多实例 + 各自过滤规则」的资源，因此独立成一组
 	// REST 接口，而不是塞进扁平的 /api/settings 键值里。
 	mux.HandleFunc("GET /api/notify/meta", s.notifyMeta)
@@ -1006,6 +1082,14 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/vulnintel/sync", s.vulnintelSyncNow)
 	mux.HandleFunc("POST /api/vulnintel/sync/cancel", s.vulnintelSyncCancel)
 	mux.HandleFunc("POST /api/vulnintel/probe", s.vulnintelProbe)
+	// 知识库（KB v2）：管理页列表/统计/facets + 检索质量摘要。
+	mux.HandleFunc("GET /api/knowledge", s.kbList)
+	mux.HandleFunc("POST /api/knowledge", s.kbCreate)
+	mux.HandleFunc("GET /api/knowledge/stats", s.kbStats)
+	mux.HandleFunc("GET /api/knowledge/facets", s.kbFacets)
+	mux.HandleFunc("GET /api/knowledge/retrieval-stats", s.kbRetrievalStats)
+	mux.HandleFunc("PATCH /api/knowledge/{id}", s.kbUpdate)
+	mux.HandleFunc("DELETE /api/knowledge/{id}", s.kbDelete)
 	mux.HandleFunc("GET /api/proxypool", s.proxyPoolGet)
 	mux.HandleFunc("PUT /api/proxypool", s.proxyPoolPut)
 	mux.HandleFunc("POST /api/proxypool/bulk", s.proxyPoolBulk)
@@ -1136,6 +1220,7 @@ func (s *Server) Handler() http.Handler {
 	// LLM 多 profile
 	mux.HandleFunc("GET /api/llm/profiles", s.pgListProfiles)
 	mux.HandleFunc("POST /api/llm/profiles", s.pgSaveProfile)
+	mux.HandleFunc("POST /api/llm/vision-probe", s.llmVisionProbe)
 	mux.HandleFunc("DELETE /api/llm/profiles/{id}", s.pgDeleteProfile)
 	mux.HandleFunc("POST /api/llm/profiles/active", s.pgActivateProfile)
 	mux.HandleFunc("GET /api/llm/retry-policy", s.pgGetLLMRetryPolicy)
@@ -1147,6 +1232,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/llm/presets", s.llmPresets)
 	mux.HandleFunc("GET /api/llm/model-meta", s.llmModelMeta)
 	mux.HandleFunc("POST /api/llm/check", s.llmCheck)
+	// Base URL 归一提示与自动探测（保存前即时提示 / 保存后实测并写回）。
+	mux.HandleFunc("POST /api/llm/url-hint", s.llmURLHint)
+	mux.HandleFunc("POST /api/llm/probe", s.llmProbe)
 
 	// 拦截规则管理
 	mux.HandleFunc("GET /api/intercept/rules", s.interceptListRules)
@@ -3718,22 +3806,32 @@ func (s *Server) settingsPayload() map[string]any {
 	apc := autopilotConfigFromPG(s.m.pg)
 	ib := intentBudgetFromPG(s.m.pg)
 	tb := taskBudgetFromPG(s.m.pg)
+	updateProxySaved, updateProxyEffective, updateProxySource := s.updateProxyInfo()
 	return map[string]any{
-		"traffic_capture":        s.m.TrafficEnabled(),
-		"traffic_retention_days": s.trafficRetentionDays(),
-		"agent_traffic_binding":  s.m.pg.GetBool(settingAgentTrafficBinding, false),
-		"llm_record":             s.m.LLMRecordEnabled(),
-		"web_search_enabled":     on,
-		"web_search_backend":     backend,
-		"brave_key_set":          strings.TrimSpace(braveKey) != "",
-		"tavily_key_set":         strings.TrimSpace(tavilyKey) != "",
-		"web_search_proxy":       proxy,                                                     // 独立出口代理(http/https/socks5)，空=直连
-		"global_proxy":           s.m.GlobalProxy(),                                         // 全局出口代理(http/https/socks5)，所有目标流量走它，空=直连
-		"artifact_max_count":     func() int { c, _ := s.m.pg.ArtifactQuota(); return c }(), // #45/#50 证据附件限额（生效值）
-		"artifact_max_bytes":     func() int64 { _, b := s.m.pg.ArtifactQuota(); return b }(),
-		"install_proxy":          s.installProxy(),            // 装机代理：用于宿主工具安装和程序更新等维护请求
-		"python_interpreter":     strings.TrimSpace(pyStored), // 用户/自动设的值(空=用运行时检测)
-		"workers":                s.m.Workers(),               // 并发工作 agent 数(默认3)；对之后启动的任务生效
+		"traffic_capture":               s.m.TrafficEnabled(),
+		"traffic_mode":                  s.m.TrafficMode(),
+		"traffic_retention_days":        s.trafficRetentionDays(),
+		"traffic_evidence_window_hours": s.trafficEvidenceHours(),
+		"traffic_evidence_max_gb":       s.trafficEvidenceMaxGB(),
+		"storage_llm_keep_days":         s.llmKeepDays(),
+		"storage_llm_max_rows":          s.llmMaxRows(),
+		"agent_traffic_binding":         s.m.pg.GetBool(settingAgentTrafficBinding, false),
+		"llm_record":                    s.m.LLMRecordEnabled(),
+		"llm_record_body_mode":          s.m.LLMRecordBodyMode(),
+		"web_search_enabled":            on,
+		"web_search_backend":            backend,
+		"brave_key_set":                 strings.TrimSpace(braveKey) != "",
+		"tavily_key_set":                strings.TrimSpace(tavilyKey) != "",
+		"web_search_proxy":              proxy,                                                     // 独立出口代理(http/https/socks5)，空=直连
+		"global_proxy":                  s.m.GlobalProxy(),                                         // 全局出口代理(http/https/socks5)，所有目标流量走它，空=直连
+		"artifact_max_count":            func() int { c, _ := s.m.pg.ArtifactQuota(); return c }(), // #45/#50 证据附件限额（生效值）
+		"artifact_max_bytes":            func() int64 { _, b := s.m.pg.ArtifactQuota(); return b }(),
+		"install_proxy":                 s.installProxy(),            // 装机代理：用于宿主工具安装和程序更新等维护请求
+		"update_proxy":                  updateProxySaved,            // 更新专用代理（空=跟随环境变量/装机/全局）
+		"update_proxy_effective":        updateProxyEffective,        // 更新链路当前实际使用的代理（空=直连）
+		"update_proxy_source":           updateProxySource,           // update/env/install/global/direct
+		"python_interpreter":            strings.TrimSpace(pyStored), // 用户/自动设的值(空=用运行时检测)
+		"workers":                       s.m.Workers(),               // 并发工作 agent 数(默认3)；对之后启动的任务生效
 		// 冷节点压缩的输出预算与墙钟上限。0 = 用默认值(32768 token / 20 分钟)。
 		"compaction_max_tokens":      s.m.CompactionTokens(),
 		"compaction_timeout_seconds": s.m.CompactionTimeout(),
@@ -3832,10 +3930,17 @@ func (s *Server) pgDetectPython(w http.ResponseWriter, r *http.Request) {
 // off, agents get no proxy config, no traffic tools, and no proxy prompt content.
 func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		TrafficCapture       *bool `json:"traffic_capture"`
-		TrafficRetentionDays *int  `json:"traffic_retention_days"`
-		AgentTrafficBinding  *bool `json:"agent_traffic_binding"`
-		LLMRecord            *bool `json:"llm_record"` // LLM 录制开关（默认关）；即时生效，无需重建 agent
+		TrafficCapture       *bool   `json:"traffic_capture"`
+		TrafficMode          *string `json:"traffic_mode"` // off/evidence/full
+		TrafficRetentionDays *int    `json:"traffic_retention_days"`
+		// 证据模式短窗口与容量上限；LLM 审计留存（0=关闭）。
+		TrafficEvidenceHours *int    `json:"traffic_evidence_window_hours"`
+		TrafficEvidenceMaxGB *int    `json:"traffic_evidence_max_gb"`
+		StorageLLMKeepDays   *int    `json:"storage_llm_keep_days"`
+		StorageLLMMaxRows    *int    `json:"storage_llm_max_rows"`
+		AgentTrafficBinding  *bool   `json:"agent_traffic_binding"`
+		LLMRecord            *bool   `json:"llm_record"` // LLM 录制开关（默认关）；即时生效，无需重建 agent
+		LLMRecordBodyMode    *string `json:"llm_record_body_mode"`
 		// Web search. WebSearchEnabled/Backend toggle the tool + backend; BraveKey/TavilyKey
 		// are optional — omit (null) to leave a stored key untouched, send "" to clear.
 		WebSearchEnabled *bool   `json:"web_search_enabled"`
@@ -3845,6 +3950,7 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		WebSearchProxy   *string `json:"web_search_proxy"`   // 独立出口代理(http/https/socks5)；null=不改，""=清空
 		GlobalProxy      *string `json:"global_proxy"`       // 全局出口代理(http/https/socks5)；null=不改，""=清空(直连)
 		InstallProxy     *string `json:"install_proxy"`      // 装机代理：null=不改，""=清空设置。不触发 agent 重建
+		UpdateProxy      *string `json:"update_proxy"`       // 更新专用代理；null=不改，""=清除并继承环境变量/装机/全局代理
 		PythonInterp     *string `json:"python_interpreter"` // 自定义脚本工具的 python 解释器路径
 		Workers          *int    `json:"workers"`            // 并发工作 agent 数(>0)；对之后启动的任务生效
 		// 冷节点压缩的输出预算与墙钟上限。null=不改，<=0=恢复默认。
@@ -4301,6 +4407,12 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if req.LLMRecordBodyMode != nil {
+		if err := s.m.SetLLMRecordBodyMode(*req.LLMRecordBodyMode); err != nil {
+			writeErr(w, 400, err.Error())
+			return
+		}
+	}
 	changed := false
 	if req.LLMPoolEnabled != nil {
 		if err := s.m.SetLLMPoolEnabled(*req.LLMPoolEnabled); err != nil {
@@ -4327,7 +4439,14 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if req.TrafficCapture != nil {
+	if req.TrafficMode != nil {
+		if err := s.m.SetTrafficMode(*req.TrafficMode); err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		changed = true
+	} else if req.TrafficCapture != nil {
+		// 旧客户端只有 bool：true 映射到全量，false 关闭。
 		if err := s.m.SetTrafficEnabled(*req.TrafficCapture); err != nil {
 			writeErr(w, 500, err.Error())
 			return
@@ -4341,6 +4460,29 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := s.m.pg.SetSetting(settingTrafficRetentionDays, strconv.Itoa(days)); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	for _, item := range []struct {
+		key   string
+		value *int
+		max   int
+		label string
+	}{
+		{settingTrafficEvidenceHours, req.TrafficEvidenceHours, maxTrafficEvidenceHours, "traffic_evidence_window_hours"},
+		{settingTrafficEvidenceMaxGB, req.TrafficEvidenceMaxGB, maxTrafficEvidenceMaxGB, "traffic_evidence_max_gb"},
+		{settingStorageLLMKeepDays, req.StorageLLMKeepDays, maxStorageLLMKeepDays, "storage_llm_keep_days"},
+		{settingStorageLLMMaxRows, req.StorageLLMMaxRows, maxStorageLLMMaxRows, "storage_llm_max_rows"},
+	} {
+		if item.value == nil {
+			continue
+		}
+		if *item.value < 0 || *item.value > item.max {
+			writeErr(w, http.StatusBadRequest, fmt.Sprintf("%s 必须在 0-%d 之间（0=关闭）", item.label, item.max))
+			return
+		}
+		if err := s.m.pg.SetSetting(item.key, strconv.Itoa(*item.value)); err != nil {
 			writeErr(w, 500, err.Error())
 			return
 		}
@@ -4367,6 +4509,17 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// 只影响后续安装动作，不改变 agent 行为，无需 applyLLM 重建。
+	}
+	if req.UpdateProxy != nil {
+		if err := s.saveUpdateProxy(*req.UpdateProxy); err != nil {
+			if errors.Is(err, errUpdateProxyInvalid) {
+				writeErr(w, 400, err.Error())
+				return
+			}
+			writeErr(w, 500, err.Error())
+			return
+		}
+		// 更新链路缓存已在 saveUpdateProxy 里失效；不动 agent（与目标流量无关）。
 	}
 	if req.WebSearchEnabled != nil || req.WebSearchBackend != nil || req.BraveKey != nil || req.TavilyKey != nil || req.WebSearchProxy != nil {
 		// Fill unspecified fields from current state so a partial PUT doesn't reset them.
@@ -4759,6 +4912,11 @@ func securityHeaders(next http.Handler) http.Handler {
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("X-Frame-Options", "DENY")
 		h.Set("Referrer-Policy", "no-referrer")
+		// HSTS 只在 TLS 终止（直连 TLS 或反代声明 https）且设置页开启时下发：
+		// 自签证书默认关闭，否则浏览器会在用户跳过证书告警后仍强制 HTTPS。
+		if tlsHSTS.Load() && (r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")) {
+			h.Set("Strict-Transport-Security", "max-age=15552000; includeSubDomains")
+		}
 		if strings.HasPrefix(r.URL.Path, "/api/") {
 			// 认证响应与业务数据一律不落缓存/代理日志快照。
 			h.Set("Cache-Control", "no-store")

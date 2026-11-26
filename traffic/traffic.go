@@ -74,6 +74,14 @@ CREATE TABLE IF NOT EXISTS blob_refs (
   PRIMARY KEY (hash, exchange_id)
 );
 CREATE INDEX IF NOT EXISTS idx_blob_refs_ex ON blob_refs(exchange_id);
+
+-- evidence_pins keeps exchanges that an evidence/finding already references.
+-- In evidence-only capture mode everything else is pruned after a short window.
+CREATE TABLE IF NOT EXISTS evidence_pins (
+  exchange_id TEXT PRIMARY KEY,
+  pinned_at   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_evidence_pins_at ON evidence_pins(pinned_at);
 `
 
 // ftsSchema is applied separately from indexSchema: a driver build without FTS5
@@ -132,6 +140,11 @@ const (
 	// reclaimBudget caps one background reclamation. Deleting a busy host can free
 	// gigabytes, and the next deletion resumes wherever this one stopped.
 	reclaimBudget = 5 * time.Minute
+	// reclaimCheckpointTimeout bounds the final WAL truncate. TRUNCATE waits for
+	// every reader to finish its snapshot; a long traffic_search or a leaked rows
+	// iterator would otherwise hold wmu forever and, transitively, every evidence
+	// write that is waiting for the traffic store.
+	reclaimCheckpointTimeout = 10 * time.Second
 )
 
 // TrafficSearchDescription is persisted into the tool catalog for new and
@@ -162,6 +175,10 @@ type Traffic struct {
 	// reclaiming keeps a single background reclamation in flight. Concurrent ones
 	// would only contend for wmu, never finish sooner.
 	reclaiming atomic.Bool
+	// reclaimGen invalidates an in-flight reclamation. Bulk deletes bump it so the
+	// background pass stops after its current bounded chunk instead of making the
+	// first delete batch wait up to a minute for wmu.
+	reclaimGen atomic.Int64
 	// closed is shut by Close so a reclamation abandons its remaining budget
 	// instead of holding shutdown open for minutes. Nil on the zero value, which
 	// stopping() treats as "not closing".
@@ -214,7 +231,7 @@ func Open(dir, addr string) (*Traffic, error) {
 	index := filepath.Join(dir, "_index", "index.sqlite")
 	dsn := index
 	if !strings.ContainsRune(index, '?') {
-		dsn = "file:" + index + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
+		dsn = "file:" + index + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=journal_size_limit(536870912)&_pragma=wal_autocheckpoint(1000)"
 	}
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
@@ -299,7 +316,7 @@ func (t *Traffic) initIndex() error {
 	// Re-applied rather than left to the DSN so the bare-DSN fallback in Open is
 	// still correct: journal_mode persists in the file header, which is what every
 	// later connection reads.
-	for _, p := range []string{`PRAGMA journal_mode=WAL`, `PRAGMA busy_timeout=5000`} {
+	for _, p := range []string{`PRAGMA journal_mode=WAL`, `PRAGMA busy_timeout=5000`, `PRAGMA journal_size_limit=536870912`, `PRAGMA wal_autocheckpoint=1000`} {
 		if _, err := conn.ExecContext(ctx, p); err != nil {
 			return err
 		}
@@ -1342,6 +1359,9 @@ func (t *Traffic) deleteWhere(tx *sql.Tx, where string, args ...any) (int64, err
 	if _, err := tx.Exec(`DELETE FROM blob_refs WHERE exchange_id IN (SELECT id FROM exchanges WHERE `+where+`)`, args...); err != nil {
 		return 0, fmt.Errorf("删除 blob 引用: %w", err)
 	}
+	if _, err := tx.Exec(`DELETE FROM evidence_pins WHERE exchange_id IN (SELECT id FROM exchanges WHERE `+where+`)`, args...); err != nil {
+		return 0, fmt.Errorf("删除证据标记: %w", err)
+	}
 	res, err := tx.Exec(`DELETE FROM exchanges WHERE `+where, args...)
 	if err != nil {
 		return 0, fmt.Errorf("删除索引行: %w", err)
@@ -1851,10 +1871,19 @@ func (t *Traffic) indexBytes() int64 {
 //
 // Best-effort throughout. Failing to reclaim costs disk space, never
 // correctness, so errors are logged and the next deletion resumes the work.
+// CancelReclaim asks an in-flight background reclamation to stop after its
+// current bounded chunk. It is advisory: the pass may already be between chunks.
+func (t *Traffic) CancelReclaim() {
+	if t != nil {
+		t.reclaimGen.Add(1)
+	}
+}
+
 func (t *Traffic) reclaim() {
 	if !t.reclaiming.CompareAndSwap(false, true) {
 		return // one pass at a time; a second would only contend for the lock
 	}
+	gen := t.reclaimGen.Load()
 	t.reaping.Go(func() {
 		defer t.reclaiming.Store(false)
 		// One pinned connection for the whole pass: a long reclamation issues
@@ -1872,7 +1901,9 @@ func (t *Traffic) reclaim() {
 		merges := reclaimMergeSteps
 		for step := 0; ; step++ {
 			t.wmu.Lock()
-			progressed, err := t.reclaimChunk(ctx, conn, &merges)
+			chunkCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			progressed, err := t.reclaimChunk(chunkCtx, conn, &merges)
+			cancel()
 			t.wmu.Unlock()
 			if err != nil {
 				log.Printf("[traffic] 回收索引空间失败：%v", err)
@@ -1881,8 +1912,8 @@ func (t *Traffic) reclaim() {
 			if !progressed {
 				break
 			}
-			if t.stopping() {
-				return // shutdown must not wait out the remaining budget
+			if t.stopping() || t.reclaimGen.Load() != gen {
+				return // shutdown or a bulk delete must not wait out the budget
 			}
 			if step+1 >= reclaimMaxSteps {
 				log.Printf("[traffic] 索引空间回收未做完（已用满 %d 步上限），下次删除时继续", reclaimMaxSteps)
@@ -1898,8 +1929,16 @@ func (t *Traffic) reclaim() {
 		// would leave the log itself sitting at its high-water mark.
 		t.wmu.Lock()
 		defer t.wmu.Unlock()
-		if _, err := conn.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
-			log.Printf("[traffic] 截断 WAL 失败：%v", err)
+		ckCtx, cancel := context.WithTimeout(context.Background(), reclaimCheckpointTimeout)
+		defer cancel()
+		if _, err := conn.ExecContext(ckCtx, `PRAGMA busy_timeout=5000`); err != nil {
+			log.Printf("[traffic] 设置 WAL 检查点超时失败：%v", err)
+		}
+		var busy, logFrames, checkpointed int
+		if err := conn.QueryRowContext(ckCtx, `PRAGMA wal_checkpoint(TRUNCATE)`).Scan(&busy, &logFrames, &checkpointed); err != nil {
+			log.Printf("[traffic] 截断 WAL 失败（被占用或超时，下轮继续）：%v", err)
+		} else if busy != 0 {
+			log.Printf("[traffic] WAL 截断被读者占用（busy=%d log=%d checkpointed=%d），下轮继续", busy, logFrames, checkpointed)
 		}
 	})
 }

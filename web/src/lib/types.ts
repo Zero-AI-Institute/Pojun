@@ -206,7 +206,23 @@ export interface DeleteTaskResult {
   files_deleted: boolean;
   findings_deleted: number;
   llm_records_deleted: number;
+  /** 流量/LLM/文件清理已转入后台队列；对应计数保持 0。 */
+  cleanup_queued?: boolean;
   cleanup_warning?: string;
+}
+
+/** 任务删除后的后台清理作业。 */
+export interface CleanupJob {
+  id: number;
+  task_id?: number;
+  kind: "traffic" | "llm" | "files" | string;
+  state: "pending" | "running" | "done" | "failed";
+  attempts: number;
+  total: number;
+  done: number;
+  last_error?: string;
+  created_at: string;
+  updated_at: string;
 }
 
 export type TaskArchiveState =
@@ -1216,9 +1232,15 @@ export interface Settings {
   artifact_max_count?: number; // #45/#50 证据附件每任务件数上限（生效值）
   artifact_max_bytes?: number; // 证据附件每任务总字节上限（生效值）
   traffic_capture: boolean;
-  traffic_retention_days?: number; // 未引用流量 TTL；0=关闭
+  traffic_mode?: "off" | "evidence" | "full"; // 三段式流量留存：关闭/仅证据相关/全量
+  traffic_retention_days?: number; // 全量模式未引用流量 TTL；0=关闭
+  traffic_evidence_window_hours?: number; // 证据模式未绑定流量保留小时数
+  traffic_evidence_max_gb?: number; // 证据模式流量容量上限（GB，0=不限）
+  storage_llm_keep_days?: number; // LLM 审计保留天数；0=关闭
+  storage_llm_max_rows?: number; // LLM 审计行数上限；0=不限
   agent_traffic_binding: boolean; // Agent 自动绑定流量证据，默认关闭；不影响人工绑定
   llm_record: boolean; // LLM 录制开关（默认关）；关闭时不记录任何 LLM 调用
+  llm_record_body_mode?: "off" | "errors" | "full"; // 正文落库策略；默认 errors
   // Web search. brave_key_set / tavily_key_set reflect whether a key is stored
   // (the values are never returned). On PUT, send the corresponding field to set/clear.
   web_search_enabled: boolean;
@@ -1236,6 +1258,12 @@ export interface Settings {
   // 装机代理(http/https/socks5)，用于宿主工具安装和程序更新等维护请求。
   // 设置为空时可由 POJUN_INSTALL_PROXY 提供。
   install_proxy?: string;
+  // 更新专用代理：只作用于查版本/下载整包/hostd 跟随升级。空=跟随
+  // POJUN_UPDATE_PROXY → 装机代理 → 全局代理 → 直连。
+  update_proxy?: string;
+  // 只读：更新链路当前实际生效的代理与来源（update/env/install/global/direct）。
+  update_proxy_effective?: string;
+  update_proxy_source?: string;
   python_interpreter?: string; // 自定义脚本工具的 python 解释器路径(空=运行时检测)
   workers?: number; // 并发工作 agent 数(默认3)；对之后启动的任务生效
   // 冷节点压缩的输出预算(思考+正文共用)与单次墙钟超时。0=用默认值
@@ -1412,6 +1440,12 @@ export interface LLMProfile {
   prompt_apply_inherited?: boolean;
   // 反向引用：哪些 Agent 覆盖了本配置的思考强度（只读）。
   effort_overrides?: { agent_key: string; reasoning_effort: string; updated_at?: string }[];
+  // 视觉能力三态：""=自动（探测缓存 > 预设 > 模型名 > 默认关）| "on"=强制支持 | "off"=强制不支持
+  vision_mode?: "" | "on" | "off";
+  // 解析后的实际能力（只读，后端算好返回）与结论来源：
+  // profile=用户指定 | probe=已探测 | preset=厂商预设 | name=模型名推断 | default=默认不支持
+  vision?: boolean;
+  vision_source?: "profile" | "probe" | "preset" | "name" | "default";
 }
 
 // ─── LLM 厂商知识层（v0.4.91 配置重构）───
@@ -1446,8 +1480,52 @@ export interface LLMModelMeta {
   model: string;
   context_k: number;
   max_output_k?: number;
+  /** 建议的输出上限（只填空值，不覆盖用户手改）。 */
+  max_tokens?: number;
+  /** 建议的输出上限字段名（openai 协议的 reasoning 模型用 max_completion_tokens）。 */
+  max_tokens_field?: string;
+  thinking_type?: string;
+  reasoning_effort?: string;
   reasoning: boolean;
   source: "meta" | "preset" | "none";
+  // 自动档的真实结论（配置页即时显示）：vision_source 含义同 LLMProfile。
+  vision?: boolean;
+  vision_source?: "profile" | "probe" | "preset" | "name" | "default";
+}
+
+/** POST /api/llm/url-hint —— Base URL 失焦时的本地归一结论（不发网络请求）。 */
+export interface LLMURLHint {
+  normalized: string;
+  changed: boolean;
+  /** true=修正无歧义，可直接写回输入框；false=只提示。 */
+  confident: boolean;
+  note?: string;
+  /** 协议建议（空=无强信号）；切换必须由用户确认。 */
+  suggested_format?: "" | "anthropic" | "openai" | "openai-responses";
+  suggested_base_url?: string;
+  protocol_reason?: string;
+}
+
+/** POST /api/llm/probe 的一条逐组合结果。 */
+export interface LLMProbeAttempt {
+  provider: string;
+  base_url: string;
+  stage: "models" | "chat";
+  ok: boolean;
+  reachable?: boolean;
+  status_code?: number;
+  error_class?: string;
+  error?: string;
+  models_count?: number;
+}
+
+/** POST /api/llm/probe 的结论：可用组合 + 逐条结果 + 一键修正建议。 */
+export interface LLMProbeResult {
+  ok: boolean;
+  normalized: string;
+  best: { provider: string; base_url: string; latency_ms: number; reply?: string };
+  attempts: LLMProbeAttempt[];
+  suggestion?: { provider: string; base_url: string; reason: string };
 }
 export interface LLMCheckResult {
   ok: boolean;
@@ -1685,6 +1763,11 @@ export interface MCPServer {
   last_error?: string;
   last_latency_ms?: number;
   tool_count?: number;
+  // 工具描述指纹（v0.9.86）：变化=升级或 rug-pull；suspicious=描述命中注入话术数。
+  tools_hash?: string;
+  tools_hash_at?: string;
+  tools_changed?: boolean;
+  tools_suspicious?: number;
 }
 
 // ---- 确定性回归检查（v0.4.119） ----
@@ -2141,6 +2224,34 @@ export interface UpdateCheck {
   comparable?: boolean;
   /** comparable 为 false 时的说明。 */
   reason?: string;
+  /** 进行中的更新快照（页面刷新后据此接回 SSE；running=false 时 phase 可能是 staged）。 */
+  update?: UpdateProgress & { running: boolean };
+  /** 更新专用代理（已保存原值，空=跟随环境变量/装机/全局）。 */
+  update_proxy?: string;
+  /** 更新链路当前实际生效值（空=直连）。 */
+  update_proxy_effective?: string;
+  /** 生效值来源：update=专用设置 / env=POJUN_UPDATE_PROXY / install=装机 / global=全局 / direct=直连。 */
+  update_proxy_source?: "update" | "env" | "install" | "global" | "direct" | string;
+  /** 上次更新结果（跨进程重启保留）：running/staged/failed。 */
+  last_update?: UpdateLastRun;
+}
+
+/** 最近一次更新的跨重启记录（settings.update_last_run）。 */
+export interface UpdateLastRun {
+  from: string;
+  to: string;
+  status: "running" | "staged" | "failed";
+  error?: string;
+  at: string;
+}
+
+/** POST /api/update/proxy-test：用指定（或当前生效）代理真实查一次 GitHub Release。 */
+export interface UpdateProxyTestResult {
+  ok: boolean;
+  proxy: string;
+  latest?: string;
+  latency_ms: number;
+  error?: string;
 }
 
 /** /api/update/stream 推送的一条更新进度。 */
@@ -2290,6 +2401,8 @@ export interface VulnIntelConfig {
   github_token_set: boolean;
   proxy: string;
   poc_enabled: boolean;
+  /** FIRST EPSS 每日评分同步（默认关闭）；开启后 search_vulns 按 EPSS 优化排序。 */
+  epss_enabled: boolean;
   backfill_days: number;
   max_runtime_minutes: number;
   maintenance_proxy: string;
@@ -2302,6 +2415,7 @@ export interface VulnIntelConfigPatch {
   github_token?: string;
   proxy?: string;
   poc_enabled?: boolean;
+  epss_enabled?: boolean;
   backfill_days?: number;
   max_runtime_minutes?: number;
 }
@@ -2321,7 +2435,9 @@ export interface VulnIntelStatus {
   enabled: boolean;
   nuclei_templates_dir: string;
   sources: VulnIntelSource[];
-  counts: { cves: number; kev: number; pocs: number };
+  counts: { cves: number; kev: number; pocs: number; epss?: number; ghsa?: number };
+  /** 覆盖率：EPSS 只更新库内已有 CVE，scored/total 是唯一可信的进度指标。 */
+  coverage?: { epss?: { scored: number; total: number; pct: number } };
   config?: VulnIntelConfig;
   sync_running?: boolean;
   sync_started_at?: number;
@@ -2610,4 +2726,235 @@ export interface AgentLLMRoute {
   tasks: LLMRouteTaskRef[];
   observed_at: string;
   warnings: string[];
+}
+
+// ---- 内置 HTTPS 与证书管理 ----
+export type TLSMode = "off" | "selfsigned" | "import" | "acme";
+
+export interface TLSACMEConfig {
+  identifiers: string[];
+  email: string;
+  staging: boolean;
+  /** http-01 | tls-alpn-01 */
+  challenge: string;
+  http_addr: string;
+  tls_addr: string;
+}
+
+export interface TLSSettings {
+  mode: TLSMode;
+  https_addr: string;
+  hsts: boolean;
+  self_signed_sans: string[];
+  firewall_auto: boolean;
+  acme: TLSACMEConfig;
+}
+
+export interface TLSCertInfo {
+  subject: string;
+  issuer: string;
+  sans: string[];
+  not_before: string;
+  not_after: string;
+  /** selfsigned | import | acme | file */
+  source: string;
+}
+
+export interface TLSACMEStatus {
+  running: boolean;
+  last_error?: string;
+  next_renew?: string;
+  identifiers?: string[];
+  email?: string;
+  staging?: boolean;
+  challenge?: string;
+}
+
+export interface TLSStatus {
+  mode: TLSMode;
+  https_addr: string;
+  cert?: TLSCertInfo;
+  ca_available: boolean;
+  last_error?: string;
+  needs_restart: boolean;
+  acme: TLSACMEStatus;
+}
+
+export interface TLSFirewallStatus {
+  available: boolean;
+  backend?: string;
+  active?: boolean;
+  hint?: string;
+  error?: string;
+  leases?: { id: string; port: number; proto: string; backend: string; expires_at: string }[];
+}
+
+export interface TLSStatusResp {
+  status: TLSStatus;
+  settings: TLSSettings;
+  /** 当前进程是否真的以 TLS 监听。 */
+  active: boolean;
+  /** 当前进程实际监听的地址（与设置不同即需要重启）。 */
+  active_addr?: string;
+  /** 设置表里是否保存过监听地址；false 时以启动参数 -addr 为准。 */
+  addr_saved?: boolean;
+  listen_addr: string;
+  urls: string[];
+  firewall: TLSFirewallStatus;
+}
+
+// ---- 知识库（KB v2）----
+// 知识条目默认 draft；approved 才进入 agent 默认检索。quality_score 是启发式
+// 质量分（0..1），只用于排序小幅加权。products/vuln_classes/platforms/cve_ids
+// 是检索 facets，旧条目可能为空。
+export interface KnowledgeEntry {
+  id: number;
+  title: string;
+  description: string;
+  detail: string;
+  commands: string[];
+  tags: string[];
+  layer: string;
+  origin: string;
+  status: string;
+  confidence: string;
+  source: string;
+  task_id?: number;
+  finding_id?: number;
+  uses: number;
+  last_used_at?: string;
+  created_by: string;
+  created_at: string;
+  updated_at: string;
+  quality_score?: number;
+  products?: string[];
+  vuln_classes?: string[];
+  platforms?: string[];
+  cve_ids?: string[];
+  license?: string;
+  verified_at?: string;
+}
+
+export interface KnowledgeEntryInput {
+  title?: string;
+  description?: string;
+  detail?: string;
+  commands?: string[];
+  tags?: string[];
+  layer?: string;
+  status?: string;
+  confidence?: string;
+  source?: string;
+  products?: string[];
+  vuln_classes?: string[];
+  platforms?: string[];
+  cve_ids?: string[];
+  license?: string;
+}
+
+export interface KnowledgeFacet {
+  value: string;
+  count: number;
+}
+
+export interface KnowledgeFacets {
+  products: KnowledgeFacet[];
+  vuln_classes: KnowledgeFacet[];
+  platforms: KnowledgeFacet[];
+  cve_ids: KnowledgeFacet[];
+}
+
+export interface KnowledgeRetrievalStats {
+  days: number;
+  total: number;
+  zero_result: number;
+  zero_result_rate: number;
+  p95_latency_ms: number;
+  actors: number;
+  attributed_rate: number;
+}
+
+/** 资源自适应（GET/PUT /api/resource）。 */
+export interface ResourceCapacity {
+  cpu_cores: number;
+  mem_total: number;
+  mem_available: number;
+  mem_current: number;
+  disk_total: number;
+  disk_free: number;
+  load1: number;
+  cgroup_v2: boolean;
+  in_container: boolean;
+  mem_from_cgroup?: boolean;
+  cpu_from_cgroup?: boolean;
+  warnings?: string[];
+  detected_at?: string;
+}
+
+export interface ResourcePlan {
+  enabled: boolean;
+  mode: "auto" | "manual" | string;
+  workers: number;
+  task_concurrency: number;
+  max_jobs: number;
+  job_max_per_task: number;
+  job_memory_mb: number;
+  job_cpu_percent: number;
+  job_runtime_s: number;
+  scanner_scale: number;
+  gomemlimit_mb: number;
+  gomaxprocs: number;
+  cracker_workload: number;
+  cracker_runtime_s: number;
+  reasons?: string[];
+  generated_at?: string;
+}
+
+export interface ResourceManual {
+  workers?: number;
+  max_jobs?: number;
+  job_max_per_task?: number;
+  job_memory_mb?: number;
+  job_cpu_percent?: number;
+  scanner_scale?: number;
+  gomemlimit_mb?: number;
+  gomaxprocs?: number;
+  cracker_workload?: number;
+  cracker_runtime_s?: number;
+}
+
+export interface ResourceSettings {
+  auto_tune: boolean;
+  mode: "auto" | "manual";
+  threshold_high: number;
+  threshold_critical: number;
+  auto_pause_scans: boolean;
+  manual: ResourceManual;
+}
+
+/** 生效值：与计划分开，因为显式 workers / 任务并发设置优先于计划。 */
+export interface ResourceEffective {
+  workers?: number;
+  task_concurrency_enabled?: boolean;
+  task_concurrency_limit?: number;
+  job_gate?: boolean;
+  scanner_scale?: number;
+  gomaxprocs?: number;
+  gomemlimit_mb?: number;
+}
+
+export interface ResourceStatus {
+  capacity: ResourceCapacity;
+  plan: ResourcePlan;
+  initialized: boolean;
+  settings: ResourceSettings;
+  effective?: ResourceEffective;
+  usage: {
+    mem_current: number;
+    mem_total: number;
+    load1: number;
+    cgroup_v2: boolean;
+    container: boolean;
+  };
+  generated_at?: string;
 }

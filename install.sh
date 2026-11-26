@@ -81,6 +81,14 @@ POJUN 安装脚本
   --pg-super=NAME        PostgreSQL 超级用户（默认 postgres）
   --no-installer         不安装特权助手 pojun-hostd（关掉 Web 端的一键安装能力）
 
+资源护栏（环境变量，仅二进制/systemd 生效；程序内的自动计划另由设置页开关）:
+  POJUN_RESOURCE_LIMITS=0   关闭 install.sh 写入的 systemd 资源指令
+  POJUN_MEM_HIGH=16G        内存软限（默认物理内存 65%）
+  POJUN_MEM_MAX=24G         内存硬限（默认物理内存 80%；到顶 OOM 只杀本服务）
+  POJUN_CPU_QUOTA=6         6 核 → 600%（也可写 600%）；默认 CPU 核数 ×80%
+  POJUN_TASKS_MAX=4096      进程/线程上限；0/off = 不限制（默认 4096）
+  例: sudo POJUN_MEM_MAX=24G POJUN_CPU_QUOTA=600% ./install.sh --mode=binary
+
 Docker 形态专用:
   --image=REF            镜像名（默认 $IMAGE）
 
@@ -573,6 +581,115 @@ normalize_listen(){
 }
 # <<< LISTEN_HELPERS
 
+# ── 资源护栏参数归一（systemd） ───────────────────
+# 程序自己会按 cgroup/物理容量推导计划；这里再给 systemd 单元加一道系统级
+# 兜底。参数只接受明确的白名单格式，非法值直接报错而不是把坏值写进 unit
+# （systemd 对坏值常常只是静默忽略，事后很难发现护栏没生效）。
+#
+#   POJUN_RESOURCE_LIMITS=0     完全关闭（不加任何资源指令）
+#   POJUN_MEM_HIGH=16G          内存软限（支持 K/M/G/T，大小写与 B 后缀都接受）
+#   POJUN_MEM_MAX=24G           内存硬限（到顶 OOM 只杀本服务）
+#   POJUN_CPU_QUOTA=6           6 核 → 600%；也可直接写 600%
+#   POJUN_TASKS_MAX=4096        进程/线程上限；0/off/infinity = 不限制
+# >>> RESOURCE_HELPERS
+# normalize_mem_limit: 归一为 systemd 接受的大小（如 16G）；空=未设置；1=非法。
+normalize_mem_limit(){
+  local v num suffix
+  v=$(printf '%s' "${1:-}" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')
+  [ -z "$v" ] && { printf ''; return 0; }
+  case "$v" in *%*) return 1 ;; esac
+  case "$v" in *B) v="${v%B}" ;; esac
+  num="${v%%[KMGTP]*}"
+  suffix="${v#"$num"}"
+  case "$num" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$num" -gt 0 ] 2>/dev/null || return 1
+  case "$suffix" in ''|K|M|G|T) printf '%s%s' "$num" "$suffix" ;; *) return 1 ;; esac
+}
+
+# normalize_cpu_quota: 归一为 CPUQuota 百分比。带 % 原样；不带 % 时 <=256 视为
+# 核数（6 → 600%），>256 视为已经是百分比（600 → 600%）——兼容两种常见写法。
+normalize_cpu_quota(){
+  local v n
+  v=$(printf '%s' "${1:-}" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')
+  [ -z "$v" ] && { printf ''; return 0; }
+  case "$v" in
+    *%)
+      n="${v%\%}"
+      case "$n" in ''|*[!0-9]*) return 1 ;; esac
+      [ "$n" -gt 0 ] 2>/dev/null || return 1
+      printf '%s%%' "$n"
+      ;;
+    *)
+      case "$v" in ''|*[!0-9]*) return 1 ;; esac
+      [ "$v" -gt 0 ] 2>/dev/null || return 1
+      if [ "$v" -le 256 ]; then
+        printf '%s%%' "$((v * 100))"
+      else
+        printf '%s%%' "$v"
+      fi
+      ;;
+  esac
+}
+
+# normalize_tasks_max: 正整数；0/off/no/false/infinity/unlimited = 不写该指令。
+normalize_tasks_max(){
+  local v
+  v=$(printf '%s' "${1:-}" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')
+  [ -z "$v" ] && { printf ''; return 0; }
+  case "$v" in
+    0|OFF|NO|FALSE|INFINITY|UNLIMITED) printf ''; return 0 ;;
+  esac
+  case "$v" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s' "$v"
+}
+
+# build_resource_limits MEM_TOTAL_MB CPU_CORES
+# 输出可直接插进 [Service] 的指令块；参数/环境变量非法时返回 1（调用方 die）。
+build_resource_limits(){
+  local mem_total_mb="${1:-}" cpu_cores="${2:-}"
+  local enabled
+  enabled=$(printf '%s' "${POJUN_RESOURCE_LIMITS:-1}" | tr '[:lower:]' '[:upper:]')
+  case "$enabled" in
+    0|OFF|NO|FALSE) printf ''; return 0 ;;
+  esac
+
+  local mem_high mem_max cpu_quota tasks_max
+  if ! mem_high=$(normalize_mem_limit "${POJUN_MEM_HIGH:-}"); then
+    printf 'POJUN_MEM_HIGH 格式非法（示例 16G / 16384M）\n' >&2
+    return 1
+  fi
+  if ! mem_max=$(normalize_mem_limit "${POJUN_MEM_MAX:-}"); then
+    printf 'POJUN_MEM_MAX 格式非法（示例 24G / 24576M）\n' >&2
+    return 1
+  fi
+  if ! cpu_quota=$(normalize_cpu_quota "${POJUN_CPU_QUOTA:-}"); then
+    printf 'POJUN_CPU_QUOTA 格式非法（示例 6 或 600%%）\n' >&2
+    return 1
+  fi
+  if ! tasks_max=$(normalize_tasks_max "${POJUN_TASKS_MAX:-4096}"); then
+    printf 'POJUN_TASKS_MAX 格式非法（正整数，0/off=不限制）\n' >&2
+    return 1
+  fi
+
+  if [ -z "$mem_high" ] && [ -n "$mem_total_mb" ] && [ "$mem_total_mb" -ge 1024 ] 2>/dev/null; then
+    mem_high="$((mem_total_mb * 65 / 100))M"
+  fi
+  if [ -z "$mem_max" ] && [ -n "$mem_total_mb" ] && [ "$mem_total_mb" -ge 1024 ] 2>/dev/null; then
+    mem_max="$((mem_total_mb * 80 / 100))M"
+  fi
+  if [ -z "$cpu_quota" ] && [ -n "$cpu_cores" ] && [ "$cpu_cores" -ge 1 ] 2>/dev/null; then
+    cpu_quota="$((cpu_cores * 80))%"
+  fi
+
+  printf 'MemoryAccounting=yes\nCPUAccounting=yes\nIOAccounting=yes\nIOWeight=100\n'
+  [ -n "$tasks_max" ] && printf 'TasksMax=%s\n' "$tasks_max"
+  [ -n "$mem_high" ] && printf 'MemoryHigh=%s\n' "$mem_high"
+  [ -n "$mem_max" ] && printf 'MemoryMax=%s\n' "$mem_max"
+  [ -n "$cpu_quota" ] && printf 'CPUQuota=%s\n' "$cpu_quota"
+  return 0
+}
+# <<< RESOURCE_HELPERS
+
 # 升级安全：旧版的 unit/plist/compose 都默认监听所有接口，而下面三处写文件
 # 都是无条件重写并重启。覆盖前检测旧值并明确告知「会收回 loopback」。
 # 不做自动继承——保留旧暴露面必须显式 --listen=0.0.0.0:PORT。
@@ -803,6 +920,15 @@ JSON
   #   - Environment=HOME 指到安装目录：ProtectHome + 家目录不可写会让 nuclei 的模板/缓存
   #     目录(~/nuclei-templates 等)写不进去。
   # 注：--dir 若指向 /home 或 /root 底下，ProtectHome=true 会把它整个藏起来，需自行去掉该项。
+  #
+  # 资源护栏（系统级兜底；程序内还有设置页可开关的自动计划）：按物理内存 65%/80%、
+  # CPU 80% 写 MemoryHigh/MemoryMax/CPUQuota/TasksMax，给同机 PG/扫描器留余量。
+  # 环境变量可覆盖或整体关闭，非法值直接 die（systemd 会静默忽略坏值，事后很难发现）。
+  RES_MEM_TOTAL_MB=$(awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || true)
+  RES_CPU_CORES=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || true)
+  if ! RESOURCE_LIMITS=$(build_resource_limits "$RES_MEM_TOTAL_MB" "$RES_CPU_CORES"); then
+    die "资源护栏参数非法：请检查 POJUN_MEM_HIGH / POJUN_MEM_MAX / POJUN_CPU_QUOTA / POJUN_TASKS_MAX"
+  fi
   # 覆盖前先看旧 unit 是不是全接口：重写+重启会收回 loopback，必须让用户看见
   warn_legacy_exposure
   cat > "/etc/systemd/system/${SERVICE}.service" <<UNIT
@@ -832,6 +958,8 @@ ExecStart=${INSTALL_DIR}/start.sh -addr ${LISTEN_ADDR} -proxy ${PROXY_ADDR}
 ${INSTALL_PROXY_ENV}
 Restart=always
 RestartSec=5
+# 资源护栏（见上方变量；MemoryHigh 触发回收，MemoryMax 到顶 OOM 杀的是本服务而不是整机）
+${RESOURCE_LIMITS}
 # 安全加固
 NoNewPrivileges=true
 PrivateTmp=true
@@ -1100,6 +1228,9 @@ RestartSec=5
 # /run/pojun 由 systemd 建好并随停止清理;socket 本身被助手下调成 0660 root:${RUN_USER}
 RuntimeDirectory=pojun
 RuntimeDirectoryMode=0755
+# ACME 临时放行的 lease 需要跨 hostd 重启保留（见 hostd/firewall.go 的 recover）。
+StateDirectory=pojun-hostd
+StateDirectoryMode=0700
 # 助手要调 apt/dnf、写 /usr/local/bin,所以不能像主服务那样把根挂成只读。
 #
 # 这里**刻意不设 NoNewPrivileges**:实测它会连带把 CAP_SETUID/CAP_SETGID 从进程的
@@ -1108,8 +1239,9 @@ RuntimeDirectoryMode=0755
 # 助手的真实安全边界是「socket 权限 + 代码里的工具白名单」,不是这条开关。
 #
 # CapabilityBoundingSet 显式列出 apt/dpkg/维护脚本需要的项(顺带挡掉 CAP_SYS_ADMIN、
-# CAP_SYS_PTRACE、CAP_NET_ADMIN 等安装用不到的)。若将来某个包的 postinst 需要更多,
-# 按报错往里加即可。
+# CAP_SYS_PTRACE 等安装用不到的)。CAP_NET_ADMIN 只用于内置 HTTPS 的 ACME 期间
+# 临时放行 80/443（hostd/firewall.go 严格限定端口并落盘撤销）。若将来某个包的
+# postinst 需要更多,按报错往里加即可。
 PrivateTmp=true
 ProtectHome=true
 ProtectClock=true
@@ -1119,12 +1251,13 @@ ProtectKernelModules=true
 ProtectControlGroups=true
 RestrictNamespaces=true
 RestrictRealtime=true
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# AF_NETLINK 是 ufw/firewalld/nft 改规则的必经通道；缺了它防火墙接口必然 EAFNOSUPPORT。
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 LockPersonality=true
 # 刻意不设 SystemCallFilter：助手要以 root 调 apt/dpkg，而 dpkg 会执行包自带的任意
 # 维护脚本，白名单永远赶不上它们的实际需要，一旦超纲就是 SIGSYS 硬杀——装到一半被
 # 杀比安装报错更难排查。助手的真实安全边界是 socket 权限 + 代码里的工具白名单。
-CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_FOWNER CAP_FSETID CAP_KILL CAP_SETGID CAP_SETUID CAP_SETPCAP CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_SYS_CHROOT CAP_MKNOD CAP_AUDIT_WRITE CAP_SETFCAP
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_FOWNER CAP_FSETID CAP_KILL CAP_SETGID CAP_SETUID CAP_SETPCAP CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN CAP_SYS_CHROOT CAP_MKNOD CAP_AUDIT_WRITE CAP_SETFCAP
 LimitNOFILE=65536
 
 [Install]
@@ -1220,6 +1353,9 @@ services:
       POJUN_LLM_MODEL: \${POJUN_LLM_MODEL:-}
       POJUN_LLM_BASE_URL: \${POJUN_LLM_BASE_URL:-}
       POJUN_LLM_PROXY: \${POJUN_LLM_PROXY:-}
+      # 更新专用代理：只作用于版本检查/整包下载/hostd 跟随升级。留空则按
+      # 「装机代理 → 全局代理 → 直连」回退；目标流量出口不受影响。
+      POJUN_UPDATE_PROXY: \${POJUN_UPDATE_PROXY:-}
       # 装机代理：宿主环境页的「一键安装」和后台情报同步用。Docker 形态没有
       # config.json，只能走环境变量；服务端读它作为数据库 setting 的兜底。
       POJUN_INSTALL_PROXY: \${POJUN_INSTALL_PROXY:-}

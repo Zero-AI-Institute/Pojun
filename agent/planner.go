@@ -45,6 +45,7 @@ type Planner struct {
 	workDir              string                                 // shared work dir (surfaced in prompt as artifact-output target)
 	injectConstraints    func() bool                            // resolver: inject task operation constraints into system prompt? (nil = yes)
 	nonStreamingFn       func() bool                            // resolver: use non-streaming (Complete) path? (nil = streaming)
+	visionFn             func() bool                            // resolver: model accepts images? (nil = no)
 	noaEnabledFn         func() bool                            // resolver: use experimental noa compaction? (nil = off)
 	maxTokensFn          func() int                             // resolver: per-reply output cap (nil/0 = send no cap)
 	programProfile       *db.ProgramProfile                     // SRC/众测 profile（nil = 不渲染）
@@ -103,6 +104,13 @@ func (p *Planner) SetCompactor(c *Compactor) { p.compactor = c }
 func (p *Planner) SetNonStreaming(fn func() bool) { p.nonStreamingFn = fn }
 
 func (p *Planner) nonStreaming() bool { return p.nonStreamingFn != nil && p.nonStreamingFn() }
+
+// SetVision wires the per-run image-input capability for consistency: the
+// planner does not call view_image itself, but its ToolSet carries the flag so
+// potential prompt/gating logic stays in one place.
+func (p *Planner) SetVision(fn func() bool) { p.visionFn = fn }
+
+func (p *Planner) vision() bool { return p.visionFn != nil && p.visionFn() }
 
 // SetNoaEnabled wires a resolver deciding whether runs use the experimental noa
 // context-compression mechanism. nil/unset = off (built-in compaction). Read per
@@ -244,6 +252,10 @@ func renderTriggers(ts *db.ExplorationStore, evs []TriggerEvent) string {
 			b.WriteString(fmt.Sprintf("\n- 人修改了目标，由「%s」变为「%s」—— 请据新目标调整探索方向（原方向若已不适用请停派）。", ev.OldGoal, ev.NewGoal))
 		case "finding":
 			b.WriteString(fmt.Sprintf("\n- 意图 #%d（%s）的 worker 报告了一个 finding：%s", ev.IntentID, intentSummary(ts, ev.IntentID), ev.Detail))
+		case "budget_warn":
+			// 任务级预算预警（server/task_budget.go）：正文是引擎生成的收敛指令，
+			// 必须原样送达；落 default 会被渲染成「意图 #0 的 worker 结束」，指令全丢。
+			b.WriteString("\n- " + ev.Detail)
 		case "coverage_gap":
 			// 引擎侧覆盖矩阵提醒（server/coverage_nudge.go）：某一类漏洞至今没有
 			// 任何意图覆盖。不是模型自己的判断，是确定性检查的结果，优先级高。
@@ -492,6 +504,7 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	// runs in a detached goroutine so it never adds latency to this round.
 	p.compactor.OnPlannerRound(ctx, ts)
 	tsx := NewToolSet(ts, "planner")
+	tsx.SetVision(p.vision())
 	tsx.SetEgressProxy(p.proxyAddr, p.proxyCACert) // 原生 http_request/session_login 与 Bash 同源出口
 	tsx.SetFindingRecorder(p.findingRecorder)
 	tsx.SetScopeFlags(p.scopeGuard, p.scopeInheritWrites, p.crossTaskNotifyDedup)

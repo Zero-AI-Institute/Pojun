@@ -514,6 +514,22 @@ ALTER TABLE llm_profiles DROP CONSTRAINT IF EXISTS llm_profiles_prompt_pair_chec
 ALTER TABLE llm_profiles ADD  CONSTRAINT llm_profiles_prompt_pair_check
     CHECK ((prompt = '') = (prompt_mode = ''));
 
+-- 原生视觉能力（v0.4.123）：vision_mode 是用户三态(''=自动/on=支持/off=不支持)；
+-- vision_probe 是「测试视觉」探测缓存结果（''=没测过/已失效/on/off），
+-- vision_probe_sig 是探测时的配置指纹（format|base_url|model）——配置一改指纹
+-- 就对不上、结果作废，下次保存重新探测一次。默认空 = 全部走自动推断，旧配置
+-- 行为不变（纯文本模型收到的请求里不会出现图片）。
+ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS vision_mode TEXT NOT NULL DEFAULT '';
+ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS vision_probe TEXT NOT NULL DEFAULT '';
+ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS vision_probe_sig TEXT NOT NULL DEFAULT '';
+-- 先删再建，保证每次启动幂等。
+ALTER TABLE llm_profiles DROP CONSTRAINT IF EXISTS llm_profiles_vision_mode_check;
+ALTER TABLE llm_profiles ADD  CONSTRAINT llm_profiles_vision_mode_check
+    CHECK (vision_mode IN ('','on','off'));
+ALTER TABLE llm_profiles DROP CONSTRAINT IF EXISTS llm_profiles_vision_probe_check;
+ALTER TABLE llm_profiles ADD  CONSTRAINT llm_profiles_vision_probe_check
+    CHECK (vision_probe IN ('','on','off'));
+
 -- 资产 URL 结构指纹（v0.4.94 经验层）：64-bit simhash（路径段归一+参数名+title/长度
 -- 分桶），同 root_domain 下汉明距离近的 endpoint 归同簇，供变体分析找同类端点。
 ALTER TABLE assets ADD COLUMN IF NOT EXISTS simhash BIGINT NOT NULL DEFAULT 0;
@@ -677,6 +693,8 @@ ALTER TABLE tasks ADD COLUMN IF NOT EXISTS queue_mode TEXT NOT NULL DEFAULT '';
 -- 暂停开始时间；补旧库。NULL=当前未处于暂停。恢复时按 (now-paused_at)
 -- 顺延 deadline_at，避免窗口外休眠消耗任务的有效运行预算。
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS paused_at TIMESTAMPTZ;
+-- 累计暂停秒数（v0.9.90）：分钟预算 = 首次运行至今 - 累计暂停 - 当前暂停。
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS paused_total_seconds BIGINT NOT NULL DEFAULT 0;
 -- 可选的任务名称;补旧库。空串=未命名,前端展示时回退到描述。
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS name TEXT NOT NULL DEFAULT '';
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS category_id BIGINT REFERENCES task_categories(id) ON DELETE SET NULL;
@@ -1016,6 +1034,12 @@ ALTER TABLE mcp_servers ADD COLUMN IF NOT EXISTS last_ok BOOLEAN;
 ALTER TABLE mcp_servers ADD COLUMN IF NOT EXISTS last_error TEXT;
 ALTER TABLE mcp_servers ADD COLUMN IF NOT EXISTS last_latency_ms INTEGER;
 ALTER TABLE mcp_servers ADD COLUMN IF NOT EXISTS tool_count INTEGER NOT NULL DEFAULT 0;
+-- 工具描述指纹（v0.9.86）：sha256(排序后的 name+description)；变化=升级或
+-- rug-pull（同一 server 静默改描述），页面给变更提示。
+ALTER TABLE mcp_servers ADD COLUMN IF NOT EXISTS tools_hash TEXT;
+ALTER TABLE mcp_servers ADD COLUMN IF NOT EXISTS tools_hash_at TIMESTAMPTZ;
+ALTER TABLE mcp_servers ADD COLUMN IF NOT EXISTS tools_changed BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE mcp_servers ADD COLUMN IF NOT EXISTS tools_suspicious INTEGER NOT NULL DEFAULT 0;
 DROP TRIGGER IF EXISTS trg_mcp_upd ON mcp_servers;
 CREATE TRIGGER trg_mcp_upd BEFORE UPDATE ON mcp_servers
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
@@ -1627,6 +1651,12 @@ CREATE INDEX IF NOT EXISTS idx_vuln_cves_kev ON vuln_cves(kev, published_at DESC
 -- 用途：get_vuln/search_vulns 把 CWE 交给模型，并联动按 CWE 打标的
 -- 方法论 skill（server 侧 LoadSkillTags 的 cwe 标签）。
 ALTER TABLE vuln_cves ADD COLUMN IF NOT EXISTS cwes TEXT[] NOT NULL DEFAULT '{}';
+-- FIRST EPSS 每日利用概率评分（0–1）与百分位；epss_date 是该分对应的打分日。
+-- 只更新已存在的 CVE（epss.go），因此不建索引也不做 NOT NULL：NULL 表示「尚未
+-- 被 EPSS 覆盖」，与「评分 0」是两件事，排序列用 COALESCE 单独处理。
+ALTER TABLE vuln_cves ADD COLUMN IF NOT EXISTS epss DOUBLE PRECISION;
+ALTER TABLE vuln_cves ADD COLUMN IF NOT EXISTS epss_percentile DOUBLE PRECISION;
+ALTER TABLE vuln_cves ADD COLUMN IF NOT EXISTS epss_date DATE;
 
 -- 从 CPE criteria 提取的 (vendor, product) 倒排表：search_vulns 按 product 名
 -- 命中的索引。与 vuln_cves.cve_id 同生共死（upsert CVE 时先删后插）。
@@ -1790,3 +1820,121 @@ ALTER TABLE agent_profile_effort_overrides
 ALTER TABLE agent_profile_effort_overrides
     ADD CONSTRAINT agent_profile_effort_overrides_effort_check
     CHECK (reasoning_effort IN ('low','medium','high','xhigh','max'));
+
+-- ============================================================================
+-- 异步清理队列（任务删除后的流量/LLM/文件分批清理）
+-- 与 db/cleanup.go 的 EnsureCleanupJobsTable 保持一致；全部 IF NOT EXISTS，
+-- 旧库启动时幂等升级。done/failed 行保留作审计；同一 (task, kind) 同时只有
+-- 一个 pending/running 作业，避免并发删除重复做昂贵清理。
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS cleanup_jobs (
+  id          BIGSERIAL PRIMARY KEY,
+  task_id     BIGINT,
+  kind        TEXT NOT NULL,
+  payload     JSONB NOT NULL DEFAULT '{}'::jsonb,
+  state       TEXT NOT NULL DEFAULT 'pending',
+  attempts    INT NOT NULL DEFAULT 0,
+  total       BIGINT NOT NULL DEFAULT 0,
+  done        BIGINT NOT NULL DEFAULT 0,
+  last_error  TEXT NOT NULL DEFAULT '',
+  run_after   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_cleanup_jobs_state ON cleanup_jobs(state, run_after, id);
+CREATE INDEX IF NOT EXISTS idx_cleanup_jobs_task ON cleanup_jobs(task_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_cleanup_jobs_active
+  ON cleanup_jobs(task_id, kind)
+  WHERE state IN ('pending','running') AND task_id IS NOT NULL;
+
+-- ============================================================================
+-- 知识库（KB v2）：条目 + 检索日志。
+--
+-- 与 skills/（随包分发的静态方法论）和 vuln_cves（外部 CVE 情报）互补：
+-- 这里存可检索、可复用的实战方法与组件经验。条目默认 draft，人工在知识页
+-- 采纳（approved）后才进入默认检索——单条错误经验会被后续所有任务检索到，
+-- 等于让知识库自我污染。
+--
+-- search_text 由 Go 侧生成（标题/描述/标签/命令/正文的中文二元组 + 英文词），
+-- 用内置 simple 词典建表达式 GIN 索引；不依赖 pg_trgm / 向量扩展。
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS kb_entries (
+    id            BIGSERIAL PRIMARY KEY,
+    -- nkey = 归一化标题（小写、空白折叠），唯一索引即去重键
+    nkey          TEXT NOT NULL UNIQUE,
+    title         TEXT NOT NULL,
+    description   TEXT NOT NULL DEFAULT '',
+    detail        TEXT NOT NULL DEFAULT '',
+    commands      JSONB NOT NULL DEFAULT '[]'::jsonb,
+    tags          JSONB NOT NULL DEFAULT '[]'::jsonb,
+    layer         TEXT NOT NULL DEFAULT 'general',   -- general/object/infra/weakness/evidence
+    origin        TEXT NOT NULL DEFAULT 'manual',    -- seed/learned/manual
+    status        TEXT NOT NULL DEFAULT 'draft',     -- draft/approved/deprecated
+    confidence    TEXT NOT NULL DEFAULT 'observed',  -- observed/inferred
+    source        TEXT NOT NULL DEFAULT '',
+    task_id       BIGINT REFERENCES tasks(id) ON DELETE SET NULL,
+    finding_id    BIGINT REFERENCES findings(id) ON DELETE SET NULL,
+    uses          INTEGER NOT NULL DEFAULT 0,
+    last_used_at  TIMESTAMPTZ,
+    created_by    TEXT NOT NULL DEFAULT '',
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- v2 派生/结构化字段：检索与 facets 用；老条目由 BackfillDerived 回填。
+    search_text   TEXT NOT NULL DEFAULT '',
+    quality_score REAL NOT NULL DEFAULT 0,
+    products      JSONB NOT NULL DEFAULT '[]'::jsonb,
+    vuln_classes  JSONB NOT NULL DEFAULT '[]'::jsonb,
+    platforms     JSONB NOT NULL DEFAULT '[]'::jsonb,
+    cve_ids       JSONB NOT NULL DEFAULT '[]'::jsonb,
+    license       TEXT NOT NULL DEFAULT '',
+    verified_at   TIMESTAMPTZ
+);
+-- 旧库/半升级库的幂等补齐：CREATE 已含全部列，这里只兜底。
+ALTER TABLE kb_entries ADD COLUMN IF NOT EXISTS search_text TEXT NOT NULL DEFAULT '';
+ALTER TABLE kb_entries ADD COLUMN IF NOT EXISTS quality_score REAL NOT NULL DEFAULT 0;
+ALTER TABLE kb_entries ADD COLUMN IF NOT EXISTS products JSONB NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE kb_entries ADD COLUMN IF NOT EXISTS vuln_classes JSONB NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE kb_entries ADD COLUMN IF NOT EXISTS platforms JSONB NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE kb_entries ADD COLUMN IF NOT EXISTS cve_ids JSONB NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE kb_entries ADD COLUMN IF NOT EXISTS license TEXT NOT NULL DEFAULT '';
+ALTER TABLE kb_entries ADD COLUMN IF NOT EXISTS verified_at TIMESTAMPTZ;
+CREATE INDEX IF NOT EXISTS idx_kb_entries_status ON kb_entries(status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_kb_entries_layer  ON kb_entries(layer);
+CREATE INDEX IF NOT EXISTS idx_kb_entries_tags   ON kb_entries USING GIN(tags);
+CREATE INDEX IF NOT EXISTS idx_kb_entries_fts ON kb_entries
+    USING GIN (to_tsvector('simple', search_text));
+CREATE INDEX IF NOT EXISTS idx_kb_entries_quality ON kb_entries(quality_score DESC, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_kb_entries_products ON kb_entries USING GIN(products);
+CREATE INDEX IF NOT EXISTS idx_kb_entries_vulnclasses ON kb_entries USING GIN(vuln_classes);
+CREATE INDEX IF NOT EXISTS idx_kb_entries_cveids ON kb_entries USING GIN(cve_ids);
+
+-- 检索日志：只记查询词/过滤器/命中 id 与延迟，不记条目正文或任何密钥。
+-- actor/task_id 是归因必填项：任务内工具调用写 worker/planner/main + tasks.id，
+-- 非任务会话写角色名 + 0（0 表示「不属于某个任务」，不是「未归因」）。
+CREATE TABLE IF NOT EXISTS kb_retrieval_logs (
+    id         BIGSERIAL PRIMARY KEY,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    actor      TEXT NOT NULL DEFAULT 'unknown',
+    task_id    BIGINT NOT NULL DEFAULT 0,
+    mode       TEXT NOT NULL DEFAULT 'v2',
+    query      TEXT NOT NULL DEFAULT '',
+    tokens     TEXT[] NOT NULL DEFAULT '{}',
+    filters    JSONB,
+    candidates INT NOT NULL DEFAULT 0,
+    returned   INT NOT NULL DEFAULT 0,
+    top_ids    BIGINT[] NOT NULL DEFAULT '{}',
+    top_scores REAL[] NOT NULL DEFAULT '{}',
+    latency_ms INT NOT NULL DEFAULT 0,
+    clicked_id BIGINT,
+    helpful    BOOLEAN
+);
+ALTER TABLE kb_retrieval_logs ADD COLUMN IF NOT EXISTS actor TEXT NOT NULL DEFAULT 'unknown';
+ALTER TABLE kb_retrieval_logs ADD COLUMN IF NOT EXISTS task_id BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE kb_retrieval_logs ADD COLUMN IF NOT EXISTS mode TEXT NOT NULL DEFAULT 'v2';
+CREATE INDEX IF NOT EXISTS idx_kb_retrieval_logs_time ON kb_retrieval_logs(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_kb_retrieval_logs_task ON kb_retrieval_logs(task_id) WHERE task_id > 0;
+CREATE INDEX IF NOT EXISTS idx_kb_retrieval_logs_actor ON kb_retrieval_logs(actor, created_at DESC);
+
+DROP TRIGGER IF EXISTS trg_kb_entries_upd ON kb_entries;
+CREATE TRIGGER trg_kb_entries_upd BEFORE UPDATE ON kb_entries
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();

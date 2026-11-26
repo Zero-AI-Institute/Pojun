@@ -35,6 +35,9 @@ services:
       POJUN_LLM_MODEL: ${POJUN_LLM_MODEL:-}
       POJUN_LLM_BASE_URL: ${POJUN_LLM_BASE_URL:-}
       POJUN_LLM_PROXY: ${POJUN_LLM_PROXY:-}
+      # 更新专用代理：只作用于版本检查/整包下载/hostd 跟随升级；不改变目标流量出口。
+      # 留空则按「装机代理 → 全局代理 → 直连」回退。
+      POJUN_UPDATE_PROXY: ${POJUN_UPDATE_PROXY:-}
     ports:
       # 默认仅本机：控制台能在宿主机执行命令，暴露必须是显式选择。
       # 局域网直连：POJUN_BIND_IP=0.0.0.0 docker compose up -d（不推荐，优先 HTTPS 反代）。
@@ -52,6 +55,14 @@ services:
       # 改 skill 无需重建镜像，容器读的就是宿主机这份。
       - ./skills:/app/skills
     restart: unless-stopped
+    # 资源护栏（按需取消注释）。资源自适应在容器内只按 cgroup 配额缩放，
+    # 不会修改宿主 sysctl/limits；下面的 mem_limit/cpus/pids_limit 就是容器
+    # 的配额来源。不设配额时，程序会按宿主总量估算并在设置页给出「可能高估」
+    # 警告。数值请按整机规模留余量，不要让它独占宿主。
+    # mem_limit: 24g
+    # mem_reservation: 16g
+    # cpus: 6
+    # pids_limit: 4096
 
 volumes:
   pgdata:
