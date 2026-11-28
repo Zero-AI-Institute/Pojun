@@ -98,10 +98,14 @@ type promptChainMCP struct {
 }
 
 type promptChainSkill struct {
-	Name        string   `json:"name"`
-	Description string   `json:"description"`
-	InIndex     bool     `json:"in_index"`
-	MCPGated    []string `json:"mcp_gated"`
+	Name string `json:"name"`
+	// 完整描述，不做字符截断；模型侧的速查索引行只取首个语义单元，页面另行按行截断展示。
+	Description string `json:"description"`
+	InIndex     bool   `json:"in_index"`
+	// 它在速查块里的实际状态：described（有描述）/ name_only（预算用尽只留名称）/
+	// absent（不在速查块）。模型看到的与页面显示的是同一份文本。
+	IndexState string   `json:"index_state"`
+	MCPGated   []string `json:"mcp_gated"`
 }
 
 type promptChainTotals struct {
@@ -121,6 +125,8 @@ type agentPromptChain struct {
 	Totals     promptChainTotals    `json:"totals"`
 	Warnings   []string             `json:"warnings"`
 	StaticOnly bool                 `json:"static_only"`
+	// 独立提示词上限。与 LLM 配置列表同源，页面据此渲染计数器与预校验。
+	PromptMaxRunes int `json:"prompt_max_runes"`
 }
 
 func (s *Server) pgAgentPromptChain(w http.ResponseWriter, r *http.Request) {
@@ -361,7 +367,7 @@ func (s *Server) buildAgentPromptChain(pg *db.DB, a *db.Agent, profileParam stri
 		Totals: promptChainTotals{
 			Segments: len(out), Chars: totalChars, EstTokens: (totalChars + 1) / 2,
 		},
-		Warnings: warnings, StaticOnly: true,
+		Warnings: warnings, StaticOnly: true, PromptMaxRunes: maxProfilePromptRunes,
 	}, nil
 }
 
@@ -649,20 +655,23 @@ func (s *Server) promptChainSkills(pg *db.DB, a *db.Agent) []promptChainSkill {
 		desc := ""
 		mcps := []string{}
 		if sk, ok := byDir[name]; ok {
+			// 数据层给全文（TrimSpace），不再切首句+120 字；展示层自己决定怎么省略。
 			desc = strings.TrimSpace(sk.Description)
-			if i := strings.IndexAny(desc, "。；;\n"); i > 0 {
-				desc = desc[:i]
-			}
-			if r := []rune(desc); len(r) > 120 {
-				desc = string(r[:120]) + "…"
-			}
 			if sk.MCPs != nil {
 				mcps = sk.MCPs
 			}
 		}
+		described := strings.Contains(block, "- "+name+"：")
+		inIndex := described || strings.Contains(block, "- "+name+"\n")
+		state := "absent"
+		if described {
+			state = "described"
+		} else if inIndex {
+			state = "name_only"
+		}
 		out = append(out, promptChainSkill{
 			Name: name, Description: desc, MCPGated: mcps,
-			InIndex: strings.Contains(block, "- "+name+"\n") || strings.Contains(block, "- "+name+"："),
+			InIndex: inIndex, IndexState: state,
 		})
 	}
 	return out
